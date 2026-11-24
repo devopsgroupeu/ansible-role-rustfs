@@ -7,3 +7,12 @@
 - name: Validate configuration variables
   ansible.builtin.include_tasks: validate.yml
   tags: always
+
+- name: Render configuration files and the systemd unit
+  ansible.builtin.include_tasks: config.yml
+  tags: config
+
+# Reload systemd for a changed unit before the service is managed.
+- name: Flush handlers before service management
+  ansible.builtin.meta: flush_handlers
+  when: not rustfs_config_only | bool

@@ -1,0 +1,74 @@
+---
+# ==============================================================================
+# Config: directories, secrets.env, the systemd unit and the env file.
+# Runs in render mode too. Nothing here restarts RustFS: tasks/service.yml
+# compares the running process with these files on every run.
+# ==============================================================================
+
+# Owner and mode are set on each directory itself, never recursively: a data
+# dir is a drive mount point full of object data. With
+# rustfs_require_mounted_drives the preflight mount guard has already proven
+# that every data dir is a mount point; without it (dev/test) this creates
+# the data dirs.
+- name: Create RustFS directories
+  ansible.builtin.file:
+    path: "{{ item['path'] }}"
+    state: directory
+    owner: "{{ item['owner'] }}"
+    group: "{{ rustfs_group }}"
+    mode: "0750"
+  loop: >-
+    {%- set ns = namespace(out=[{'path': rustfs_home, 'owner': rustfs_user},
+                                {'path': rustfs_config_dir, 'owner': 'root'},
+                                {'path': rustfs_tls_dir, 'owner': 'root'}]) -%}
+    {%- for dir in rustfs_data_dirs -%}
+    {%-   set ns.out = ns.out + [{'path': dir, 'owner': rustfs_user}] -%}
+    {%- endfor -%}
+    {{ ns.out }}
+  loop_control:
+    label: "{{ item['path'] }}"
+  tags: config
+
+# Secrets live only in this file. systemd reads it as root, so the service
+# user needs no access. no_log keeps the values out of the log and out of
+# --diff output; there is no backup copy, which would leave old secrets on
+# disk. Rendered before the unit, which requires it.
+- name: Render secrets.env
+  ansible.builtin.template:
+    src: rustfs.secrets.env.j2
+    dest: "{{ __rustfs_secrets_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  tags: config
+
+- name: Render the systemd unit
+  ansible.builtin.template:
+    src: rustfs.service.j2
+    dest: "{{ __rustfs_unit_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd daemon
+  tags: config
+
+# The env file records the unit digest as ANSIBLE_RUSTFS_UNIT_SHA256, so a
+# unit change also changes the desired process environment and service.yml
+# restarts for it, even when the run that changed the unit died early.
+- name: Read the digest of the systemd unit
+  ansible.builtin.stat:
+    path: "{{ __rustfs_unit_file }}"
+    checksum_algorithm: sha256
+  register: __rustfs_unit_stat
+  tags: config
+
+- name: Render the env file
+  ansible.builtin.template:
+    src: rustfs.env.j2
+    dest: "{{ rustfs_env_file }}"
+    owner: root
+    group: "{{ rustfs_group }}"
+    mode: "0640"
+    backup: true
+  tags: config

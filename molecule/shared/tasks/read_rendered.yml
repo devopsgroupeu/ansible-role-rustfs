@@ -1,0 +1,54 @@
+---
+# Shared verify helper: reads the three files the role renders (default
+# paths) into decoded text facts, stats the unit and checks that systemd
+# accepts every directive of it. Outputs:
+#   __verify_env        /etc/default/rustfs
+#   __verify_secrets    /etc/rustfs/secrets.env (holds the test secrets)
+#   __verify_unit       /etc/systemd/system/rustfs.service
+#   __verify_unit_stat  stat of the unit, with its SHA-256 checksum
+# The env file and the unit are read without no_log, so a missing file shows
+# its error; the secrets file and the decoded facts are no_log.
+
+- name: Read the env file and the unit
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - /etc/default/rustfs
+    - /etc/systemd/system/rustfs.service
+  loop_control:
+    label: "{{ item }}"
+  register: __verify_rendered
+
+- name: Read the secrets file
+  ansible.builtin.slurp:
+    src: /etc/rustfs/secrets.env
+  register: __verify_secrets_raw
+  no_log: true
+
+- name: Decode the rendered files
+  ansible.builtin.set_fact:
+    __verify_env: "{{ __verify_rendered['results'][0]['content'] | b64decode }}"
+    __verify_unit: "{{ __verify_rendered['results'][1]['content'] | b64decode }}"
+    __verify_secrets: "{{ __verify_secrets_raw['content'] | b64decode }}"
+  no_log: true
+
+- name: Stat the unit with its SHA-256 checksum
+  ansible.builtin.stat:
+    path: /etc/systemd/system/rustfs.service
+    checksum_algorithm: sha256
+  register: __verify_unit_stat
+
+# systemd only warns about a misspelled key or an invalid value ("...,
+# ignoring.") and drops the setting, which would silently weaken the sandbox.
+# The exit code is not used: in render mode the binary does not exist.
+- name: Check the unit with systemd-analyze
+  ansible.builtin.command: systemd-analyze verify /etc/systemd/system/rustfs.service
+  register: __verify_analyze
+  changed_when: false
+  failed_when: false
+
+- name: Assert systemd accepts every directive of the unit
+  ansible.builtin.assert:
+    that:
+      - __verify_analyze['stderr_lines'] | select('search', 'rustfs[.]service') | select('search', 'ignoring') | list | length == 0
+    fail_msg: "systemd-analyze verify: {{ __verify_analyze['stderr'] }}"

@@ -561,3 +561,415 @@
           vars:
             __verify_expect: "must be one of"
             __verify_secret: ""
+
+# ------------------------------------------------------------------------------
+# Rendered files of the converge run (positive). This play must stay before
+# any play that renders files: the negative plays above fail in validate.yml,
+# before config.yml, so the files on disk are still the ones converge wrote.
+# ------------------------------------------------------------------------------
+
+- name: Verify rendered files
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    # Env file keys in the order of spec 7.2 for the render layout.
+    __verify_env_keys:
+      - RUSTFS_VOLUMES
+      - RUSTFS_ADDRESS
+      - RUSTFS_CONSOLE_ENABLE
+      - RUSTFS_CONSOLE_ADDRESS
+      - RUSTFS_TLS_PATH
+      - RUSTFS_TLS_RELOAD_ENABLE
+      - RUSTFS_TRUST_SYSTEM_CA
+      - RUSTFS_OBS_LOGGER_LEVEL
+      - RUSTFS_OBS_LOG_STDOUT_ENABLED
+      - RUSTFS_CHECK_UPDATE
+      - RUSTFS_UNSUPPORTED_FS_POLICY
+      - RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE
+    # secrets.env keys in the order of spec 7.3 plus the IAM master key.
+    __verify_secret_keys:
+      - RUSTFS_ACCESS_KEY
+      - RUSTFS_SECRET_KEY
+      - RUSTFS_RPC_SECRET
+      - RUSTFS_IAM_MASTER_KEY
+      - RUSTFS_IAM_MASTER_KEY_OLD_KEYS
+    __verify_markers:
+      - ANSIBLE_RUSTFS_MANAGED_KEYS
+      - ANSIBLE_RUSTFS_UNIT_SHA256
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert env file content
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_VOLUMES=\"https://rustfs-render{1...4}:9000/data/rustfs{0...3}\"' in __verify_env"
+          - "'RUSTFS_TLS_PATH=\"/etc/rustfs/tls\"' in __verify_env"
+          - "'RUSTFS_TLS_RELOAD_ENABLE=\"true\"' in __verify_env"
+          - "'RUSTFS_TRUST_SYSTEM_CA=\"false\"' in __verify_env"
+          - "'RUSTFS_OBS_LOGGER_LEVEL=\"info\"' in __verify_env"
+          - "'RUSTFS_OBS_LOG_STDOUT_ENABLED=\"true\"' in __verify_env"
+          - "'RUSTFS_CHECK_UPDATE=\"false\"' in __verify_env"
+          - "'RUSTFS_UNSUPPORTED_FS_POLICY=\"fail\"' in __verify_env"
+          - "'RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE=\"bounded\"' in __verify_env"
+          - "'ANSIBLE_RUSTFS_MANAGED_KEYS=\"' in __verify_env"
+          - "('ANSIBLE_RUSTFS_UNIT_SHA256=\"' ~ __verify_unit_stat['stat']['checksum'] ~ '\"') in __verify_env"
+          - "'RUSTFS_UNSAFE_BYPASS_DISK_CHECK' not in __verify_env"
+          - "'MOLECULEADMIN' not in __verify_env"
+          - "'molecule-secret-key-0123456789' not in __verify_env"
+          - "'molecule-rpc-secret-0123456789' not in __verify_env"
+          - "'molecule-iam-master-key-0123456789' not in __verify_env"
+          - "'molecule-old-iam-master-key-0123456789' not in __verify_env"
+        fail_msg: "the env file is missing a line or contains a secret"
+
+    # Exact line order, managed key list and quoting: every non-comment line
+    # is KEY="value", the keys come in the spec 7.2 order, and the marker
+    # lists every managed key of both files.
+    - name: Assert env file structure
+      ansible.builtin.assert:
+        that:
+          - __verify_env.splitlines()[0] == '# Managed by Ansible - do not edit manually.'
+          - __verify_env | regex_findall('(?m)^([A-Z_][A-Z0-9_]*)=') == __verify_env_keys + __verify_markers
+          - __verify_env.splitlines() | reject('match', '^(#|$)') | reject('match', '^[A-Z_][A-Z0-9_]*="[^"]*"$') | list | length == 0
+          - ('ANSIBLE_RUSTFS_MANAGED_KEYS="' ~ ((__verify_env_keys + __verify_secret_keys + __verify_markers) | sort | join(',')) ~ '"') in __verify_env
+        fail_msg: "the env file lines, their order or the managed key list are wrong"
+
+    - name: Assert secrets file content
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_ACCESS_KEY=\"MOLECULEADMIN\"' in __verify_secrets"
+          - "'RUSTFS_SECRET_KEY=\"molecule-secret-key-0123456789\"' in __verify_secrets"
+          - "'RUSTFS_RPC_SECRET=\"molecule-rpc-secret-0123456789\"' in __verify_secrets"
+          - "'RUSTFS_IAM_MASTER_KEY=\"molecule-iam-master-key-0123456789\"' in __verify_secrets"
+          - "'RUSTFS_IAM_MASTER_KEY_OLD_KEYS=\"molecule-old-iam-master-key-0123456789\"' in __verify_secrets"
+      no_log: true
+
+    - name: Assert secrets file structure
+      ansible.builtin.assert:
+        that:
+          - __verify_secrets.splitlines()[0] == '# Managed by Ansible - do not edit manually.'
+          - __verify_secrets | regex_findall('(?m)^([A-Z_][A-Z0-9_]*)=') == __verify_secret_keys
+          - __verify_secrets.splitlines() | reject('match', '^(#|$)') | reject('match', '^[A-Z_][A-Z0-9_]*="[^"]*"$') | list | length == 0
+        fail_msg: "the secrets file keys, their order or their quoting are wrong"
+
+    - name: Assert unit content
+      ansible.builtin.assert:
+        that:
+          - "'EnvironmentFile=/etc/default/rustfs' in __verify_unit"
+          - "'EnvironmentFile=/etc/rustfs/secrets.env' in __verify_unit"
+          - "'ExecStart=/usr/local/bin/rustfs server' in __verify_unit"
+          - "'ProtectSystem=strict' in __verify_unit"
+          - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /var/lib/rustfs-extra' in __verify_unit"
+          - "'TimeoutStartSec=infinity' in __verify_unit"
+          - __verify_unit is search('(?m)^CapabilityBoundingSet=$')
+          - __verify_unit is search('(?m)^AmbientCapabilities=$')
+          - "'ExecReload' not in __verify_unit"
+          - "'AssertPathIsMountPoint' not in __verify_unit"
+          - "'RequiresMountsFor' not in __verify_unit"
+          - "'EnvironmentFile=-' not in __verify_unit"
+          - "'StartLimit' not in __verify_unit"
+          - "'MOLECULEADMIN' not in __verify_unit"
+          - "'molecule-secret-key-0123456789' not in __verify_unit"
+        fail_msg: "the systemd unit is missing a directive or has a forbidden one"
+
+    - name: Stat the paths of spec 7.1
+      ansible.builtin.stat:
+        path: "{{ item['path'] }}"
+      loop:
+        - {path: /opt/rustfs, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /etc/rustfs, dir: true, owner: root, group: rustfs, mode: "0750"}
+        - {path: /etc/rustfs/tls, dir: true, owner: root, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs0, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs1, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs2, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs3, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /etc/default/rustfs, dir: false, owner: root, group: rustfs, mode: "0640"}
+        - {path: /etc/rustfs/secrets.env, dir: false, owner: root, group: root, mode: "0600"}
+        - {path: /etc/systemd/system/rustfs.service, dir: false, owner: root, group: root, mode: "0644"}
+      loop_control:
+        label: "{{ item['path'] }}"
+      register: __verify_paths
+
+    - name: Assert owners and modes of spec 7.1
+      ansible.builtin.assert:
+        that:
+          - item['stat']['exists']
+          - item['stat']['isdir'] == item['item']['dir']
+          - item['stat']['pw_name'] == item['item']['owner']
+          - item['stat']['gr_name'] == item['item']['group']
+          - item['stat']['mode'] == item['item']['mode']
+        fail_msg: >-
+          {{ item['item']['path'] }} is
+          {{ item['stat']['pw_name'] | default('missing') }}:{{ item['stat']['gr_name'] | default('') }}
+          {{ item['stat']['mode'] | default('') }}, expected
+          {{ item['item']['owner'] }}:{{ item['item']['group'] }} {{ item['item']['mode'] }}
+        quiet: true
+      loop: "{{ __verify_paths['results'] }}"
+      loop_control:
+        label: "{{ item['item']['path'] }}"
+
+# ------------------------------------------------------------------------------
+# Variant plays: "Converge <variant>" re-renders the files with the variant
+# vars on top of the scenario group_vars, "Verify <variant>" reads and asserts
+# them. They leave the container in a variant state, so they come last, and
+# molecule idempotence must never run after verify in this scenario.
+# The variants that keep the converge volumes come first: from the first
+# variant that changes rustfs_volumes on, every later variant changes the
+# deployed volumes again, so each of those sets rustfs_allow_volumes_change.
+# ------------------------------------------------------------------------------
+
+- name: Converge console disabled
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_console_enabled: false
+
+- name: Verify console disabled
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the console is off and has no address
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_CONSOLE_ENABLE=\"false\"' in __verify_env"
+          - "'RUSTFS_CONSOLE_ADDRESS' not in __verify_env"
+        fail_msg: "a disabled console still renders RUSTFS_CONSOLE_ADDRESS or a true flag"
+
+- name: Converge data dirs override
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_data_dirs: ["/srv/a", "/srv/b", "/srv/c", "/srv/d"]
+
+- name: Verify data dirs override
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert ReadWritePaths follows rustfs_data_dirs
+      ansible.builtin.assert:
+        that:
+          - "'ReadWritePaths=/opt/rustfs /srv/a /srv/b /srv/c /srv/d /var/lib/rustfs-extra' in __verify_unit"
+        fail_msg: "ReadWritePaths does not follow the rustfs_data_dirs override"
+
+    - name: Stat the overridden data dirs
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["/srv/a", "/srv/b", "/srv/c", "/srv/d"]
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_srv_dirs
+
+    - name: Assert the overridden data dirs were created rustfs:rustfs 0750
+      ansible.builtin.assert:
+        that:
+          - item['stat']['isdir'] | default(false)
+          - item['stat']['pw_name'] == 'rustfs'
+          - item['stat']['gr_name'] == 'rustfs'
+          - item['stat']['mode'] == '0750'
+        fail_msg: "{{ item['item'] }} is missing or has the wrong owner or mode"
+        quiet: true
+      loop: "{{ __verify_srv_dirs['results'] }}"
+      loop_control:
+        label: "{{ item['item'] }}"
+
+- name: Converge server domains
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_server_domains: ["s3.example.com", "s3.example.net"]
+
+- name: Verify server domains
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the domains are rendered comma-joined
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_SERVER_DOMAINS=\"s3.example.com,s3.example.net\"' in __verify_env"
+        fail_msg: "RUSTFS_SERVER_DOMAINS is missing or not comma-joined"
+
+# The host mount guard (preflight) is skipped in render mode; only the unit
+# directives are checked here.
+- name: Converge require mounted drives
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_require_mounted_drives: true
+
+- name: Verify require mounted drives
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the unit requires and asserts every data dir mount
+      ansible.builtin.assert:
+        that:
+          - "'RequiresMountsFor=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3' in __verify_unit"
+          - __verify_unit | regex_findall('(?m)^AssertPathIsMountPoint=(.*)$') == ['/data/rustfs0', '/data/rustfs1', '/data/rustfs2', '/data/rustfs3']
+          # [Unit] directives are ignored by systemd anywhere else.
+          - __verify_unit.index('AssertPathIsMountPoint=') < __verify_unit.index('[Service]')
+          - __verify_unit.index('RequiresMountsFor=') < __verify_unit.index('[Service]')
+        fail_msg: "RequiresMountsFor or one AssertPathIsMountPoint per data dir is missing from [Unit]"
+
+- name: Converge TLS disabled
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_tls_enabled: false
+        rustfs_volumes: ["http://rustfs-render{1...4}:9000/data/rustfs{0...3}"]
+        rustfs_allow_volumes_change: true
+
+- name: Verify TLS disabled
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the env file has no TLS lines
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_VOLUMES=\"http://rustfs-render{1...4}:9000/data/rustfs{0...3}\"' in __verify_env"
+          - "'RUSTFS_TLS_PATH' not in __verify_env"
+          - "'RUSTFS_TLS_RELOAD_ENABLE' not in __verify_env"
+          - "'RUSTFS_TRUST_SYSTEM_CA' not in __verify_env"
+        fail_msg: "TLS lines are rendered although rustfs_tls_enabled is false"
+
+- name: Converge single node single drive
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_volumes: ["/data/rustfs0"]
+        rustfs_rpc_secret: ""
+        rustfs_allow_volumes_change: true
+
+- name: Verify single node single drive
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the SNSD layout and no RPC secret
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_VOLUMES=\"/data/rustfs0\"' in __verify_env"
+          - "'RUSTFS_RPC_SECRET' not in __verify_secrets"
+          - "'RUSTFS_RPC_SECRET' not in __verify_env"
+          - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /var/lib/rustfs-extra' in __verify_unit"
+        fail_msg: "the SNSD layout is wrong or an empty rustfs_rpc_secret is still rendered"
+
+- name: Converge privileged S3 port
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_address: ":443"
+        rustfs_volumes: ["https://rustfs-render{1...4}/data/rustfs{0...3}"]
+        rustfs_allow_volumes_change: true
+
+- name: Verify privileged S3 port
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the unit grants CAP_NET_BIND_SERVICE only
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_ADDRESS=\":443\"' in __verify_env"
+          - __verify_unit is search('(?m)^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$')
+          - __verify_unit is search('(?m)^AmbientCapabilities=CAP_NET_BIND_SERVICE$')
+        fail_msg: "a port below 1024 does not grant exactly CAP_NET_BIND_SERVICE"
+
+- name: Converge two pools
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_volumes:
+          - "https://rustfs-render{1...4}:9000/data/rustfs{0...3}"
+          - "https://rustfs-render{5...8}:9000/data/rustfs{0...3}"
+        rustfs_cluster_hosts:
+          - rustfs-render1
+          - rustfs-render2
+          - rustfs-render3
+          - rustfs-render4
+          - rustfs-render5
+          - rustfs-render6
+          - rustfs-render7
+          - rustfs-render8
+        rustfs_allow_volumes_change: true
+
+- name: Verify two pools
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert both pools are joined and the drives listed once
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_VOLUMES=\"https://rustfs-render{1...4}:9000/data/rustfs{0...3} https://rustfs-render{5...8}:9000/data/rustfs{0...3}\"' in __verify_env"
+          - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /var/lib/rustfs-extra' in __verify_unit"
+        fail_msg: "the two pools are not joined by one space or the drive paths repeat"

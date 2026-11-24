@@ -1,0 +1,18 @@
+---
+# ==============================================================================
+# Handlers
+# There is intentionally no "restart rustfs" handler. A notified restart is
+# lost when a run dies between rendering and the flush, and it cannot choose
+# between a rolling restart and restarting all changed nodes together.
+# tasks/service.yml decides instead, on every run, by comparing the running
+# process (binary and environment) with the desired state.
+# ==============================================================================
+
+# Picks up a changed unit file. The start and restart tasks in service.yml
+# also pass daemon_reload: true, so a reload lost with an interrupted run is
+# recovered on the next run.
+- name: Reload systemd daemon
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  listen: "reload systemd daemon"
+  when: not rustfs_config_only | bool

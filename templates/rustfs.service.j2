@@ -1,0 +1,67 @@
+# Managed by Ansible - do not edit manually.
+# Changes to this file will be overwritten on the next playbook run.
+
+[Unit]
+Description=RustFS Object Storage Server
+Documentation=https://docs.rustfs.com
+Wants=network-online.target
+After=network-online.target
+AssertFileIsExecutable={{ __rustfs_bin }}
+ConditionFileNotEmpty={{ rustfs_env_file }}
+{% if rustfs_require_mounted_drives | bool %}
+# Never write object data to the root disk when a drive is not mounted.
+RequiresMountsFor={{ rustfs_data_dirs | join(' ') }}
+{% for dir in rustfs_data_dirs %}
+AssertPathIsMountPoint={{ dir }}
+{% endfor %}
+{% endif %}
+
+[Service]
+Type=notify
+NotifyAccess=main
+User={{ rustfs_user }}
+Group={{ rustfs_group }}
+WorkingDirectory={{ rustfs_home }}
+# No "-" prefix: a missing environment file must fail the start.
+EnvironmentFile={{ rustfs_env_file }}
+EnvironmentFile={{ __rustfs_secrets_file }}
+ExecStart={{ __rustfs_bin }} server
+StandardOutput=journal
+StandardError=journal
+# A node that waits for its peers must keep retrying: no start rate limit.
+Restart=always
+RestartSec=10s
+# READY=1 is sent only after read and lock quorum, so a node of a cold
+# cluster waits for its peers; the role waits for readiness itself.
+TimeoutStartSec=infinity
+TimeoutStopSec=45s
+LimitNOFILE=1048576
+LimitNPROC=32768
+TasksMax=infinity
+UMask=0027
+
+# Sandbox
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths={{ ([rustfs_home] + rustfs_data_dirs + rustfs_systemd_read_write_paths) | join(' ') }}
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+SystemCallArchitectures=native
+# Empty unless a listener port is below 1024.
+CapabilityBoundingSet={{ __rustfs_capabilities }}
+AmbientCapabilities={{ __rustfs_capabilities }}
+
+[Install]
+WantedBy=multi-user.target
