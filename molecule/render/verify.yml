@@ -2,7 +2,8 @@
 # Verify the render scenario without starting RustFS.
 # Play 1 includes the role with public: true (render mode), so the derived
 # __rustfs_* values and the validate facts are visible here, then asserts
-# them; task-level vars override the scenario group_vars per case.
+# them; task-level vars override the scenario group_vars per case. It gathers
+# facts, which the later plays reuse. The negative plays follow it.
 
 - name: Verify derived values
   hosts: all
@@ -113,3 +114,450 @@
       ansible.builtin.assert:
         that: rustfs_node_address == 'localhost'
         fail_msg: "rustfs_node_address for a wildcard listener is {{ rustfs_node_address }}"
+
+# ------------------------------------------------------------------------------
+# Negative plays: each case includes the role inside block / rescue and checks
+# the refusal with molecule/shared/tasks/expect_failure.yml (the message holds
+# the expected text and never the secret). One play per case; gather_facts is
+# false because the facts gathered by the first play stay cached.
+# ------------------------------------------------------------------------------
+
+# The public upstream default is refused.
+- name: "Negative: default access key"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_access_key: "rustfsadmin"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted the default access key"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_access_key"
+            __verify_secret: ""
+
+# A root secret key is required.
+- name: "Negative: empty secret key"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_secret_key: ""
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted an empty secret key"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_secret_key"
+            __verify_secret: ""
+
+# The message must not echo the secret.
+- name: "Negative: RPC secret equal to the secret key"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_rpc_secret: "molecule-secret-key-0123456789"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted an RPC secret equal to the secret key"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_rpc_secret"
+            __verify_secret: "molecule-secret-key-0123456789"
+
+# The render layout is distributed, so the RPC secret is required.
+- name: "Negative: missing RPC secret in distributed mode"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_rpc_secret: ""
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a missing RPC secret in distributed mode"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_rpc_secret"
+            __verify_secret: ""
+
+# The render layout is distributed, so the IAM master key is required.
+- name: "Negative: missing IAM master key in distributed mode"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_iam_master_key: ""
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a missing IAM master key in distributed mode"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_iam_master_key"
+            __verify_secret: ""
+
+# At least 32 characters; the message must not echo the key.
+- name: "Negative: short IAM master key"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_iam_master_key: "molecule-short-iam-key"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a short IAM master key"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_iam_master_key"
+            __verify_secret: "molecule-short-iam-key"
+
+# Secrets are rendered as KEY="value"; the message must not echo the secret.
+- name: "Negative: backslash in a secret"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_secret_key: 'molecule-secret\key-0123456789'
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a backslash in the secret key"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "backslash"
+            __verify_secret: 'molecule-secret\key-0123456789'
+
+# {0..3} is shell syntax; RustFS needs {0...3}.
+- name: "Negative: two-dot ellipsis"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_volumes: ["https://rustfs-render{1...4}:9000/data/rustfs{0..3}"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a two-dot ellipsis"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "{0...3}"
+            __verify_secret: ""
+
+# TLS on means https:// volumes.
+- name: "Negative: http volumes with TLS on"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_volumes: ["http://rustfs-render{1...4}:9000/data/rustfs{0...3}"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted http volumes with TLS on"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "https://"
+            __verify_secret: ""
+
+# An explicit volume port must be the rustfs_address port.
+- name: "Negative: URL port differing from the listener"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_volumes: ["https://rustfs-render{1...4}:9100/data/rustfs{0...3}"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a volume port that differs from the listener"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "9100"
+            __verify_secret: ""
+
+# Keys the role owns are refused.
+- name: "Negative: reserved key in rustfs_extra_env"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_extra_env: {RUSTFS_ADDRESS: ":9100"}
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a reserved key in rustfs_extra_env"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "RUSTFS_ADDRESS"
+            __verify_secret: ""
+
+# The IAM master key has its own variable; the message must not echo it.
+- name: "Negative: IAM master key in rustfs_extra_secret_env"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_extra_secret_env: {RUSTFS_IAM_MASTER_KEY: "molecule-iam-master-key-0123456789"}
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted RUSTFS_IAM_MASTER_KEY in rustfs_extra_secret_env"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "RUSTFS_IAM_MASTER_KEY"
+            __verify_secret: "molecule-iam-master-key-0123456789"
+
+# Values must be strings.
+- name: "Negative: boolean value in rustfs_extra_env"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_extra_env: {RUSTFS_FOO: true}
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a boolean value in rustfs_extra_env"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "quote"
+            __verify_secret: ""
+
+# PrivateTmp hides /tmp from the service.
+- name: "Negative: data dir under /tmp"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_data_dirs: ["/tmp/rustfs0", "/data/rustfs1", "/data/rustfs2", "/data/rustfs3"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a data dir under /tmp"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "/tmp"
+            __verify_secret: ""
+
+# RustFS rejects nested drives.
+- name: "Negative: nested data dirs"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_data_dirs: ["/data/a", "/data/a/b", "/data/c", "/data/d"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted nested data dirs"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "/data/a/b"
+            __verify_secret: ""
+
+# Short inventory names with FQDN volumes: rustfs_node_address stays at its
+# default rustfs-render1. Both values must be in the message.
+- name: "Negative: node address not among the volume hosts"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_volumes: ["https://node{1...4}.example.com:9000/data/rustfs{0...3}"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a node address that is not among the volume hosts"
+      rescue:
+        - name: Check the refusal names the volume hosts
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "node1.example.com"
+            __verify_secret: ""
+
+        - name: Check the refusal names the node address
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs-render1"
+            __verify_secret: ""
+
+# Every wait needs at least one attempt.
+- name: "Negative: rustfs_ready_retries 0"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_ready_retries: 0
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted rustfs_ready_retries 0"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_ready_retries"
+            __verify_secret: ""
+
+# Refused by role argument validation (argument_specs choices), before
+# validate.yml runs.
+- name: "Negative: rustfs_libc glibc"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_libc: "glibc"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted rustfs_libc glibc"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "must be one of"
+            __verify_secret: ""

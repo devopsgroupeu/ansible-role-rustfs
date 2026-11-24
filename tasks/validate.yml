@@ -3,7 +3,517 @@
 # Variable and play-shape validation. Runs at the start of every play, in
 # render mode too (tag: always). Fail closed: nothing on the host is touched
 # before these rules pass.
+# Choice lists (rustfs_libc, rustfs_unsupported_fs_policy, rustfs_log_level,
+# rustfs_service_state) are checked by role argument validation
+# (meta/argument_specs.yml), which runs before this file; no assert repeats
+# them. Argument validation does not convert values, so the asserts below
+# also check that strings, lists and dicts really are of that type.
+# No fail_msg echoes a secret: credential messages name the variable only.
+# Regexes: char classes instead of backslash escapes where possible. Inside
+# {{ }} (fail_msg, task vars) string constants are raw, so a backslash is
+# written once ('\1'); inside {% %} statements and in that: conditionals
+# Jinja unescapes string constants, so it is written twice ('\\1', '\\s').
+# fail_msg and task vars are templated even when the assert passes, so they
+# must not fail on a value of the wrong type.
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Formats (rules 1 to 5)
+# ------------------------------------------------------------------------------
+
+- name: Validate rustfs_version
+  ansible.builtin.assert:
+    that:
+      - rustfs_version is match('^[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.]+)?$')
+    fail_msg: >-
+      rustfs_version '{{ rustfs_version }}' is not a bare SemVer version.
+      Use the upstream tag format without a "v" prefix, for example "1.0.6".
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_arch
+  ansible.builtin.assert:
+    that:
+      - rustfs_arch in ['x86_64', 'aarch64']
+    fail_msg: >-
+      Unsupported architecture '{{ ansible_facts['architecture'] | default('unknown') }}'
+      (ansible_facts['architecture']; resolved rustfs_arch '{{ rustfs_arch }}').
+      RustFS ships x86_64 and aarch64 builds only. Set rustfs_arch to
+      "x86_64" or "aarch64" only if the facts name one of them differently.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_checksum
+  ansible.builtin.assert:
+    that:
+      - rustfs_checksum == '' or rustfs_checksum is match('^[a-f0-9]{64}$')
+    fail_msg: >-
+      rustfs_checksum '{{ rustfs_checksum }}' is not a SHA-256 digest. Set the
+      64 lowercase hex characters of the release zip digest (no "sha256:"
+      prefix), or leave it empty to use the pinned digest of the default
+      version or the SHA256SUMS file next to the asset.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_address
+  ansible.builtin.assert:
+    that:
+      - rustfs_address is match('^\\S*:[0-9]{1,5}$')
+      - (__rustfs_port | int) >= 1 and (__rustfs_port | int) <= 65535
+    fail_msg: >-
+      rustfs_address '{{ rustfs_address }}' is not "[host]:port" with a port
+      from 1 to 65535. Examples: ":9000" (all interfaces), "10.0.0.11:9000",
+      "[fd00::11]:9000".
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_console_address
+  ansible.builtin.assert:
+    that:
+      - rustfs_console_address is match('^\\S*:[0-9]{1,5}$')
+      - (__rustfs_console_port | int) >= 1 and (__rustfs_console_port | int) <= 65535
+      - not (rustfs_console_enabled | bool) or (__rustfs_console_port | int) != (__rustfs_port | int)
+    fail_msg: >-
+      rustfs_console_address '{{ rustfs_console_address }}' is not
+      "[host]:port" with a port from 1 to 65535, or the console is enabled
+      and its port equals the S3 port of rustfs_address
+      '{{ rustfs_address }}'. Use another port for the console (default
+      ":9001") or set rustfs_console_enabled: false.
+    quiet: true
+  tags: always
+
+# ------------------------------------------------------------------------------
+# Volumes (rules 6 to 11)
+# ------------------------------------------------------------------------------
+
+- name: Validate rustfs_volumes is a list of volume expressions
+  ansible.builtin.assert:
+    that:
+      - rustfs_volumes is not string
+      - rustfs_volumes | length > 0
+      - rustfs_volumes | reject('string') | list | length == 0
+      - rustfs_volumes | select('equalto', '') | list | length == 0
+      - rustfs_volumes | select('search', '\\s') | list | length == 0
+    fail_msg: >-
+      rustfs_volumes {{ rustfs_volumes }} must be a non-empty list of
+      non-empty strings without whitespace, one upstream volume expression
+      per server pool, for example ["/data/rustfs{0...3}"] or
+      ["https://rustfs{1...4}.example.com:9000/data/rustfs{0...3}"].
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_volumes uses three-dot ranges
+  ansible.builtin.assert:
+    that:
+      - rustfs_volumes | select('search', '[{][0-9]+[.][.][0-9]+[}]') | list | length == 0
+    fail_msg: >-
+      rustfs_volumes {{ rustfs_volumes }} contains a two-dot range such as
+      {0..3}. That is shell brace syntax; RustFS expands only three-dot
+      ranges: write {0...3}.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_volumes does not mix paths and URLs
+  ansible.builtin.assert:
+    that:
+      - >-
+        (rustfs_volumes | select('match', '^/') | list | length == rustfs_volumes | length)
+        or (rustfs_volumes | select('match', '^https?://') | list | length == rustfs_volumes | length)
+    fail_msg: >-
+      rustfs_volumes {{ rustfs_volumes }} must be all local paths (single
+      node, starting with "/") or all URLs (cluster, starting with
+      "https://" or "http://"), not a mix.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_volumes uses pool expressions
+  ansible.builtin.assert:
+    that:
+      - >-
+        (rustfs_volumes | length == 1 and not (__rustfs_distributed | bool))
+        or (rustfs_volumes | reject('search', '[.][.][.]') | list | length == 0)
+    fail_msg: >-
+      rustfs_volumes {{ rustfs_volumes }} has more than one item or URL
+      items, so every item must be a pool expression with an ellipsis, for
+      example "https://rustfs{1...4}:9000/data/rustfs{0...3}". Only a single
+      local item may be a plain path ("/data/rustfs0", one drive).
+    quiet: true
+  tags: always
+
+# Host part and path part: at most one decimal range {N...M} each, N <= M.
+# Any other brace is refused (hex ranges are a documented role restriction).
+- name: Validate the ellipsis ranges of rustfs_volumes
+  vars:
+    __rustfs_bad_ranges: >-
+      {%- set ns = namespace(out=[], ok=true) -%}
+      {%- for vol in rustfs_volumes -%}
+      {%-   set host = (vol | regex_replace('^https?://([^/]*).*$', '\\1')) if vol is match('^https?://') else '' -%}
+      {%-   set path = vol | regex_replace('^https?://[^/]*', '') -%}
+      {%-   set ns.ok = true -%}
+      {%-   for part in [host, path] -%}
+      {%-     set ranges = part | regex_findall('[{][^{}]*[}]') -%}
+      {%-     if (ranges | length > 1) or ((part | regex_replace('[{][^{}]*[}]', '')) is search('[{}]')) -%}
+      {%-       set ns.ok = false -%}
+      {%-     endif -%}
+      {%-     for r in ranges -%}
+      {%-       set m = r | regex_search('^[{]([0-9]+)[.][.][.]([0-9]+)[}]$', '\\1', '\\2') -%}
+      {%-       if (not m) or ((m[0] | int) > (m[1] | int)) -%}
+      {%-         set ns.ok = false -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-   endfor -%}
+      {%-   if not ns.ok -%}
+      {%-     set ns.out = ns.out + [vol] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_bad_ranges | length == 0
+    fail_msg: >-
+      rustfs_volumes items {{ __rustfs_bad_ranges }} have an invalid range.
+      The host part and the path part may each hold at most one decimal
+      range {N...M} with N <= M ({01...12} zero-pads); hex ranges and other
+      braces are not supported by this role.
+    quiet: true
+  tags: always
+
+# A URL without a port uses the local listener port upstream, so only an
+# explicit port can differ.
+- name: Validate the scheme and port of the rustfs_volumes URLs
+  vars:
+    __rustfs_volume_ports: >-
+      {{ rustfs_volumes | select('match', '^https?://')
+         | map('regex_replace', '^https?://([^/]*).*$', '\1')
+         | map('regex_search', ':[0-9]+$') | select
+         | map('regex_replace', '^:', '') | map('int') | unique | list }}
+  ansible.builtin.assert:
+    that:
+      - rustfs_volumes | select('match', '^https?://') | reject('match', '^' ~ __rustfs_scheme ~ '://') | list | length == 0
+      - __rustfs_volume_ports | reject('equalto', __rustfs_port | int) | list | length == 0
+    fail_msg: >-
+      rustfs_volumes {{ rustfs_volumes }} must use the scheme
+      "{{ __rustfs_scheme }}://" and, when a URL names a port, the port
+      {{ __rustfs_port }} of rustfs_address '{{ rustfs_address }}' (ports
+      found: {{ __rustfs_volume_ports }}). TLS on (rustfs_tls_enabled) means
+      https:// volumes, TLS off means http:// volumes. Nodes talk to each
+      other on the S3 port; there is no separate cluster port.
+    quiet: true
+  tags: always
+
+# ------------------------------------------------------------------------------
+# Paths (rule 12)
+# ------------------------------------------------------------------------------
+
+# /tmp and /var/tmp are hidden by PrivateTmp; /home, /root and /run/user by
+# ProtectHome. flatten also copes with a string given for a list.
+- name: Validate the role paths
+  vars:
+    __rustfs_bad_paths: >-
+      {{ [rustfs_data_dirs, rustfs_home, rustfs_config_dir, rustfs_tls_dir, rustfs_systemd_read_write_paths]
+         | flatten | map('string') | map('regex_replace', '/+', '/')
+         | select('match', '^(?!/)|^/$|^/(tmp|var/tmp|home|root|run/user)(/|$)') | list }}
+  ansible.builtin.assert:
+    that:
+      - rustfs_data_dirs is not string
+      - rustfs_data_dirs | length > 0
+      - __rustfs_bad_paths | length == 0
+    fail_msg: >-
+      Refused paths: {{ __rustfs_bad_paths }}; rustfs_data_dirs
+      {{ rustfs_data_dirs }} must be a non-empty list. Every entry of
+      rustfs_data_dirs and rustfs_systemd_read_write_paths, and rustfs_home,
+      rustfs_config_dir and rustfs_tls_dir, must be absolute, must not be "/"
+      and must not be at or under /tmp or /var/tmp (hidden by PrivateTmp) or
+      /home, /root or /run/user (hidden by ProtectHome).
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_data_dirs are unique and not nested
+  vars:
+    __rustfs_dirs: "{{ rustfs_data_dirs | map('string') | map('regex_replace', '/+', '/') | map('regex_replace', '/$', '') | list }}"
+    __rustfs_dir_conflicts: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for a in __rustfs_dirs -%}
+      {%-   if __rustfs_dirs | select('equalto', a) | list | length > 1 -%}
+      {%-     set ns.out = ns.out + [a] -%}
+      {%-   endif -%}
+      {%-   for b in __rustfs_dirs if b.startswith(a ~ '/') -%}
+      {%-     set ns.out = ns.out + [b] -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ ns.out | unique }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_dir_conflicts | length == 0
+    fail_msg: >-
+      rustfs_data_dirs {{ rustfs_data_dirs }} has duplicate or nested
+      entries: {{ __rustfs_dir_conflicts }}. Every drive needs its own
+      directory, and RustFS refuses a drive inside another drive.
+    quiet: true
+  tags: always
+
+# ------------------------------------------------------------------------------
+# Credentials (rules 13 to 16). No no_log: an assert prints its condition
+# text and fail_msg, never a value, and no message here shows a secret.
+# ------------------------------------------------------------------------------
+
+- name: Validate rustfs_access_key
+  ansible.builtin.assert:
+    that:
+      - rustfs_access_key is string
+      - rustfs_access_key is match('^[A-Za-z0-9._-]{3,128}$')
+      - rustfs_access_key != 'rustfsadmin'
+    fail_msg: >-
+      rustfs_access_key is empty, is the public upstream default
+      "rustfsadmin", or is not 3 to 128 characters of A-Z, a-z, 0-9, ".",
+      "_" and "-" (the value is not shown). Set a unique root access key from
+      Ansible Vault, for example 20 random uppercase letters and digits.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_secret_key
+  ansible.builtin.assert:
+    that:
+      - rustfs_secret_key is string
+      - rustfs_secret_key | length >= 8
+      - rustfs_secret_key != 'rustfsadmin'
+      - rustfs_secret_key != rustfs_access_key
+    fail_msg: >-
+      rustfs_secret_key is empty, shorter than 8 characters, the public
+      upstream default "rustfsadmin" or equal to rustfs_access_key (the value
+      is not shown). Set a random root secret key of 40 or more characters
+      from Ansible Vault.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_rpc_secret
+  ansible.builtin.assert:
+    that:
+      - >-
+        (not (__rustfs_distributed | bool) and rustfs_rpc_secret == '')
+        or (rustfs_rpc_secret is string and rustfs_rpc_secret | length >= 8
+            and rustfs_rpc_secret != 'rustfsadmin' and rustfs_rpc_secret != rustfs_secret_key)
+    fail_msg: >-
+      rustfs_rpc_secret {{ 'is required in distributed mode and ' if __rustfs_distributed | bool else '' }}must
+      be at least 8 characters, not "rustfsadmin" and not equal to
+      rustfs_secret_key (the value is not shown). Set the same random secret
+      of 40 or more characters for every node from Ansible Vault (group_vars).
+    quiet: true
+  tags: always
+
+# Upstream (crates/iam/src/keyring.rs) enforces no length or format and trims
+# whitespace, so the role requires at least 32 characters after trimming.
+- name: Validate rustfs_iam_master_key
+  ansible.builtin.assert:
+    that:
+      - >-
+        (not (__rustfs_distributed | bool) and rustfs_iam_master_key == '')
+        or (rustfs_iam_master_key is string and rustfs_iam_master_key | trim | length >= 32)
+    fail_msg: >-
+      rustfs_iam_master_key {{ 'is required in distributed mode and ' if __rustfs_distributed | bool else '' }}must
+      be at least 32 characters, not counting leading and trailing whitespace
+      (the value is not shown). It encrypts IAM data at rest
+      (RUSTFS_IAM_MASTER_KEY). Set the same random key for every node from
+      Ansible Vault (group_vars), for example the output of
+      "openssl rand -base64 48".
+    quiet: true
+  tags: always
+
+# Secrets are rendered as KEY="value" into secrets.env.
+- name: Validate the secret values
+  vars:
+    __rustfs_bad_secrets: >-
+      {{ ({'rustfs_access_key': rustfs_access_key,
+           'rustfs_secret_key': rustfs_secret_key,
+           'rustfs_rpc_secret': rustfs_rpc_secret,
+           'rustfs_iam_master_key': rustfs_iam_master_key}
+          | dict2items | selectattr('value', 'string') | selectattr('value', 'search', '["\\\n]')
+          | map(attribute='key') | list)
+         + ((rustfs_extra_secret_env if rustfs_extra_secret_env is mapping else {})
+            | dict2items | selectattr('value', 'string') | selectattr('value', 'search', '["\\\n]')
+            | map(attribute='key') | map('regex_replace', '^', 'rustfs_extra_secret_env.') | list) }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_bad_secrets | length == 0
+    fail_msg: >-
+      {{ __rustfs_bad_secrets | join(', ') }}: the value contains a double
+      quote, a backslash or a newline (the value is not shown). Secrets are
+      rendered as KEY="value" into secrets.env, where these characters break
+      the file. Generate the secret without them.
+    quiet: true
+  tags: always
+
+# ------------------------------------------------------------------------------
+# Extra environment (rule 17)
+# ------------------------------------------------------------------------------
+
+- name: Validate the extra environment keys
+  vars:
+    __rustfs_env_keys: "{{ (rustfs_extra_env | list) if rustfs_extra_env is mapping else [] }}"
+    __rustfs_secret_env_keys: "{{ (rustfs_extra_secret_env | list) if rustfs_extra_secret_env is mapping else [] }}"
+    __rustfs_bad_env_keys: >-
+      {{ (((__rustfs_env_keys + __rustfs_secret_env_keys) | reject('match', '^[A-Z_][A-Z0-9_]*$') | list)
+          + ((__rustfs_env_keys + __rustfs_secret_env_keys) | select('match', '^(MINIO_|ANSIBLE_RUSTFS_)') | list)
+          + ((__rustfs_env_keys + __rustfs_secret_env_keys) | select('in', __rustfs_reserved_env) | list)
+          + (__rustfs_env_keys | intersect(__rustfs_secret_env_keys)))
+         | unique }}
+  ansible.builtin.assert:
+    that:
+      - rustfs_extra_env is mapping
+      - rustfs_extra_secret_env is mapping
+      - __rustfs_bad_env_keys | length == 0
+    fail_msg: >-
+      rustfs_extra_env and rustfs_extra_secret_env must be dicts. Refused
+      keys: {{ __rustfs_bad_env_keys }}. Keys must match ^[A-Z_][A-Z0-9_]*$,
+      must not start with MINIO_ or ANSIBLE_RUSTFS_, must not be a key the
+      role sets itself (__rustfs_reserved_env in vars/main.yml; use the role
+      variable instead, for example rustfs_iam_master_key for
+      RUSTFS_IAM_MASTER_KEY) and must not be in both dicts.
+    quiet: true
+  tags: always
+
+- name: Validate the extra environment values
+  vars:
+    __rustfs_extra_items: >-
+      {{ ((rustfs_extra_env if rustfs_extra_env is mapping else {}) | dict2items)
+         + ((rustfs_extra_secret_env if rustfs_extra_secret_env is mapping else {}) | dict2items) }}
+    __rustfs_bad_env_values: >-
+      {{ (__rustfs_extra_items | rejectattr('value', 'string') | map(attribute='key') | list)
+         + (__rustfs_extra_items | selectattr('value', 'string') | selectattr('value', 'search', '["\\\n]')
+            | map(attribute='key') | list) }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_bad_env_values | length == 0
+    fail_msg: >-
+      Values of rustfs_extra_env and rustfs_extra_secret_env must be strings
+      without a double quote, a backslash or a newline; quote booleans and
+      numbers ("true", "30"). Refused keys: {{ __rustfs_bad_env_values }}
+      (values not shown).
+    quiet: true
+  tags: always
+
+# ------------------------------------------------------------------------------
+# Cross-variable (rules 18 and 19)
+# ------------------------------------------------------------------------------
+
+- name: Validate rustfs_tls_generate_certs needs rustfs_tls_enabled
+  ansible.builtin.assert:
+    that:
+      - not (rustfs_tls_generate_certs | bool) or (rustfs_tls_enabled | bool)
+    fail_msg: >-
+      rustfs_tls_generate_certs is true but rustfs_tls_enabled is false.
+      Enable TLS, or set rustfs_tls_generate_certs: false.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_ready_retries and rustfs_ready_delay
+  ansible.builtin.assert:
+    that:
+      - (rustfs_ready_retries | int) >= 1
+      - (rustfs_ready_delay | int) >= 1
+    fail_msg: >-
+      rustfs_ready_retries ({{ rustfs_ready_retries }}) and rustfs_ready_delay
+      ({{ rustfs_ready_delay }}) must be integers of at least 1: every wait
+      needs at least one attempt and a pause of at least one second between
+      attempts.
+    quiet: true
+  tags: always
+
+# ------------------------------------------------------------------------------
+# Distributed mode only (rules 20 to 22)
+# ------------------------------------------------------------------------------
+
+- name: Validate this host is in rustfs_cluster_hosts
+  when: __rustfs_distributed | bool
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname in rustfs_cluster_hosts
+    fail_msg: >-
+      Inventory host '{{ inventory_hostname }}' is not in rustfs_cluster_hosts
+      {{ rustfs_cluster_hosts }}. rustfs_cluster_hosts defaults to the
+      'rustfs' inventory group: put every node of the cluster in that group,
+      or set rustfs_cluster_hosts to the inventory names of the cluster.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_node_address is one of the volume hosts
+  when: __rustfs_distributed | bool
+  ansible.builtin.assert:
+    that:
+      - rustfs_node_address in __rustfs_volume_hosts
+    fail_msg: >-
+      rustfs_node_address '{{ rustfs_node_address }}' of inventory host
+      '{{ inventory_hostname }}' is not one of the hosts in rustfs_volumes:
+      {{ __rustfs_volume_hosts }}. It defaults to inventory_hostname; the
+      typical cause is short inventory names with FQDN volume hosts. Use the
+      volume host names in the inventory, or set rustfs_node_address per host
+      (host_vars) to the name this node has in rustfs_volumes.
+    quiet: true
+  tags: always
+
+- name: Validate rustfs_cluster_hosts matches the volume hosts
+  when: __rustfs_distributed | bool
+  ansible.builtin.assert:
+    that:
+      - rustfs_cluster_hosts | unique | length == __rustfs_volume_hosts | length
+    fail_msg: >-
+      rustfs_cluster_hosts has {{ rustfs_cluster_hosts | unique | length }}
+      hosts {{ rustfs_cluster_hosts | unique }} but rustfs_volumes names
+      {{ __rustfs_volume_hosts | length }} hosts {{ __rustfs_volume_hosts }}.
+      Every node in rustfs_volumes needs exactly one inventory host in
+      rustfs_cluster_hosts.
+    quiet: true
+  tags: always
+
+- name: Validate the play does not use serial
+  when: __rustfs_distributed | bool
+  ansible.builtin.assert:
+    that:
+      - ansible_play_batch | length == ansible_play_hosts | length
+    fail_msg: >-
+      This play runs in batches of {{ ansible_play_batch | length }} of
+      {{ ansible_play_hosts | length }} hosts (serial). Remove serial: the
+      role restarts nodes one at a time itself, and serial breaks the first
+      bootstrap (every node must start in the same run) and the cluster
+      consistency check.
+    quiet: true
+  tags: always
+
+# A fact, because role defaults are not visible through hostvars.
+- name: Set the cluster fingerprint of this host
+  when: __rustfs_distributed | bool
+  ansible.builtin.set_fact:
+    __rustfs_fingerprint: >-
+      {{ [rustfs_version, rustfs_libc, __rustfs_volumes_string, __rustfs_port,
+          rustfs_tls_enabled | bool, rustfs_cluster_hosts | sort,
+          rustfs_access_key, rustfs_secret_key, rustfs_rpc_secret, rustfs_iam_master_key,
+          rustfs_extra_env | dictsort, rustfs_extra_secret_env | dictsort]
+         | to_json | hash('sha256') }}
+  no_log: true
+  tags: always
+
+# Evaluated on every host (no run_once), so every host reports a mismatch.
+- name: Validate one cluster per play
+  when: __rustfs_distributed | bool
+  vars:
+    __rustfs_cluster_nodes: >-
+      {{ ansible_play_hosts | map('extract', hostvars) | selectattr('__rustfs_fingerprint', 'defined') | list }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_cluster_nodes | map(attribute='__rustfs_fingerprint') | unique | length == 1
+    fail_msg: >-
+      The distributed hosts of this play do not share one cluster
+      configuration: {{ __rustfs_cluster_nodes
+      | rejectattr('__rustfs_fingerprint', 'equalto', (__rustfs_cluster_nodes | first)['__rustfs_fingerprint'])
+      | map(attribute='inventory_hostname') | list }} differ from
+      {{ (__rustfs_cluster_nodes | first)['inventory_hostname'] }}. All nodes
+      of a cluster need identical rustfs_version, rustfs_libc,
+      rustfs_volumes, rustfs_address port, rustfs_tls_enabled,
+      rustfs_cluster_hosts, credentials (access key, secret key, RPC secret,
+      IAM master key), rustfs_extra_env and rustfs_extra_secret_env. Define
+      them in group_vars, and run one play per cluster.
+    quiet: true
+  tags: always
 
 # ------------------------------------------------------------------------------
 # Per-host facts for the rollout (rule 23, no assert, every mode)

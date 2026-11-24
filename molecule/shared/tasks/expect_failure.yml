@@ -1,0 +1,14 @@
+---
+# Shared assertion for negative tests, included from the rescue section of a
+# block that ran the role and then a task named "Fail because the role did not
+# refuse". Inputs:
+#   __verify_expect  text that must be in the failure message
+#   __verify_secret  text that must NOT be in it ('' skips the check)
+
+- name: Assert the role refused with the expected message
+  ansible.builtin.assert:
+    that:
+      - ansible_failed_task['name'] != 'Fail because the role did not refuse'
+      - __verify_expect in (ansible_failed_result['msg'] | default(''))
+      - (__verify_secret | default('')) == '' or __verify_secret not in (ansible_failed_result['msg'] | default(''))
+    fail_msg: "expected '{{ __verify_expect }}' in: {{ ansible_failed_result['msg'] | default('') }}"
