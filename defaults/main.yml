@@ -1,0 +1,227 @@
+---
+# ==============================================================================
+# Install
+# ==============================================================================
+
+# Pinned RustFS version, bare SemVer without a "v" prefix (the upstream tag
+# format). Bumping it installs a new versioned binary next to the old one and
+# rolls the cluster node by node. Lowering it is refused unless
+# rustfs_allow_downgrade is true.
+rustfs_version: "1.0.6"
+
+# Build flavour of the release asset: "musl" (static binary, runs everywhere)
+# or "gnu" (needs glibc >= 2.31 on the target, adds profiling support).
+rustfs_libc: "musl"
+
+# Arch token of the release asset. Explicit x86_64/aarch64 map; any other
+# architecture resolves to "" and is rejected by validate.yml (upstream ships
+# nothing else).
+rustfs_arch: "{{ {'x86_64': 'x86_64', 'amd64': 'x86_64', 'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(ansible_facts['architecture'], '') }}"
+
+# Download base URL; the role appends /<version>/<asset>. A mirror must keep
+# that layout, and also serve SHA256SUMS there when no digest is pinned or
+# given in rustfs_checksum.
+rustfs_download_base_url: "https://github.com/rustfs/rustfs/releases/download"
+
+# Expected SHA-256 of the release zip (64 lowercase hex characters). Empty:
+# the digest pinned in vars/main.yml for the default version, otherwise the
+# SHA256SUMS file next to the asset. Set it for air-gapped mirrors.
+rustfs_checksum: ""
+
+# Directory for the versioned binary, the rustfs symlink and the temporary
+# download directory. It must allow execution.
+rustfs_bin_dir: "/usr/local/bin"
+
+# Allow installing a version lower than the installed one. Upstream documents
+# only an immediate rollback to the previous release.
+rustfs_allow_downgrade: false
+
+# ==============================================================================
+# Paths / users
+# ==============================================================================
+
+# Service user (system account, no login shell). Do not change it after the
+# first bootstrap: ownership is never set recursively.
+rustfs_user: "rustfs"
+
+# Service group. Same rule as rustfs_user.
+rustfs_group: "rustfs"
+
+# Home and working directory of the service.
+rustfs_home: "/opt/rustfs"
+
+# Directory that holds secrets.env and, by default, the TLS directory.
+rustfs_config_dir: "/etc/rustfs"
+
+# Non-secret environment file read by the unit (the upstream path on both OS
+# families). Secrets never go here; they go to <rustfs_config_dir>/secrets.env.
+rustfs_env_file: "/etc/default/rustfs"
+
+# TLS directory (RUSTFS_TLS_PATH). File names inside are fixed by RustFS:
+# rustfs_cert.pem, rustfs_key.pem and ca.crt.
+rustfs_tls_dir: "{{ rustfs_config_dir }}/tls"
+
+# ==============================================================================
+# Storage / topology
+# ==============================================================================
+
+# REQUIRED. One upstream volume expression per server pool, rendered as
+# RUSTFS_VOLUMES joined by spaces. Must be identical on every node. Ranges use
+# three dots: "/data/rustfs{0...3}" (SNMD) or
+# "https://rustfs{1...4}.example.com:9000/data/rustfs{0...3}" (cluster).
+# A pool layout is immutable once the cluster is bootstrapped.
+rustfs_volumes: []
+
+# Local drive paths on this host. Derived from the path part of
+# rustfs_volumes; override per host only when pools use different paths.
+rustfs_data_dirs: "{{ __rustfs_volume_paths }}"
+
+# Refuse to continue unless every data dir is a mount point, and make the
+# unit refuse to start on an unmounted drive (RequiresMountsFor and
+# AssertPathIsMountPoint). Set false only for dev/test; the role then creates
+# the directories on whatever filesystem holds them.
+rustfs_require_mounted_drives: true
+
+# Allow RUSTFS_VOLUMES or RUSTFS_ERASURE_SET_DRIVE_COUNT to differ from the
+# deployed value. Only for appending a pool or removing a decommissioned one;
+# the changed nodes are restarted together.
+rustfs_allow_volumes_change: false
+
+# What RustFS does when a drive sits on NFS, FUSE, overlayfs and similar:
+# "fail" (refuse to start) or "warn" (log and continue).
+rustfs_unsupported_fs_policy: "fail"
+
+# Skip the check that every drive is a distinct physical disk. Test
+# environments only (containers, loop devices); never in production.
+rustfs_unsafe_bypass_disk_check: false
+
+# Inventory hosts that form this node's cluster. Distributed mode: the
+# "rustfs" inventory group, used for consistency checks, the CA host and peer
+# health checks. A standalone node is its own cluster.
+rustfs_cluster_hosts: "{{ (groups['rustfs'] | default([inventory_hostname])) if __rustfs_distributed else [inventory_hostname] }}"
+
+# Name or IP under which this node's S3 port is probed. In a cluster it must
+# be the host name used for this node in rustfs_volumes; with TLS it must be
+# covered by the certificate. Default: inventory_hostname in a cluster, else
+# the listen host of rustfs_address, or "localhost" for a wildcard listener.
+rustfs_node_address: "{{ inventory_hostname if __rustfs_distributed else (__rustfs_listen_host if __rustfs_listen_host not in ['', '0.0.0.0', '::'] else 'localhost') }}"
+
+# ==============================================================================
+# Listener / console
+# ==============================================================================
+
+# S3, admin, health and internode listener, "[host]:port". Same port on every
+# node; there is no separate cluster port.
+rustfs_address: ":9000"
+
+# Serve the web console.
+rustfs_console_enabled: true
+
+# Console listener, "[host]:port". It listens on all interfaces by default:
+# bind it to a management address or firewall it.
+rustfs_console_address: ":9001"
+
+# Domains for virtual-hosted-style requests, rendered comma-joined as
+# RUSTFS_SERVER_DOMAINS. Empty: path-style requests only.
+rustfs_server_domains: []
+
+# ==============================================================================
+# Credentials
+# ==============================================================================
+
+# REQUIRED. Root access key, 3 to 128 characters of [A-Za-z0-9._-]; the
+# public default "rustfsadmin" is refused. Source it from Ansible Vault.
+rustfs_access_key: ""
+
+# REQUIRED. Root secret key, at least 8 characters, not "rustfsadmin" and not
+# equal to the access key. Source it from Ansible Vault.
+rustfs_secret_key: ""
+
+# Internode RPC secret. REQUIRED in distributed mode and identical on all
+# nodes; at least 8 characters and not equal to the secret key. Changing it
+# restarts the cluster together. Source it from Ansible Vault.
+rustfs_rpc_secret: ""
+
+# IAM master key (RUSTFS_IAM_MASTER_KEY), rendered into secrets.env only.
+# Encrypts IAM data at rest and is required for MFA enrollment. REQUIRED in
+# distributed mode, recommended everywhere; at least 32 characters. Changing
+# it is a rolling restart: keep the old key in
+# rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] until every blob
+# is rewritten. Source it from Ansible Vault.
+rustfs_iam_master_key: ""
+
+# ==============================================================================
+# TLS
+# ==============================================================================
+
+# TLS on the S3, console and internode traffic. Decide before the first
+# bootstrap: it changes the volume scheme (https:// vs http://).
+rustfs_tls_enabled: true
+
+# Generate a private CA and node certificates with community.crypto. Dev/test
+# only: the CA key is copied to every node. Production places its own
+# rustfs_cert.pem, rustfs_key.pem and ca.crt in rustfs_tls_dir.
+rustfs_tls_generate_certs: false
+
+# Validity of generated certificates (community.crypto relative time).
+rustfs_tls_cert_validity: "+825d"
+
+# Extra SANs for generated certificates, already prefixed
+# ("DNS:s3.example.com", "IP:10.0.0.10").
+rustfs_tls_extra_sans: []
+
+# Trust the OS CA store for outbound and peer connections and for the role's
+# probes. When false, ca.crt in rustfs_tls_dir is required.
+rustfs_tls_trust_system_ca: false
+
+# ==============================================================================
+# Logging / extra environment
+# ==============================================================================
+
+# Log level: "trace", "debug", "info", "warn" or "error". Upstream defaults to
+# "error"; "info" shows startup and readiness progress. Logs always go to
+# journald.
+rustfs_log_level: "info"
+
+# Extra non-secret variables rendered into the env file (string values; quote
+# booleans and numbers). Must be identical on every node of a cluster. Keys
+# the role owns are refused.
+rustfs_extra_env: {}
+
+# Extra secret variables rendered into secrets.env (KMS token, OIDC client
+# secret, RUSTFS_IAM_MASTER_KEY_OLD_KEYS). Same rules as rustfs_extra_env.
+rustfs_extra_secret_env: {}
+
+# ==============================================================================
+# systemd
+# ==============================================================================
+
+# Extra writable paths under the ProtectSystem=strict sandbox (KMS key dir,
+# notification queue dirs, a log directory). Every path must already exist.
+rustfs_systemd_read_write_paths: []
+
+# ==============================================================================
+# Service control
+# ==============================================================================
+
+# Enable the unit at boot.
+rustfs_service_enabled: true
+
+# Desired service state: "started" or "stopped".
+rustfs_service_state: "started"
+
+# Restart changed nodes one at a time with health gates. False restarts all
+# changed nodes together (maintenance window, or a node is permanently down).
+rustfs_rolling_restart: true
+
+# Attempts for every wait (new main process, /health/ready, peer
+# re-admission, cluster gate).
+rustfs_ready_retries: 60
+
+# Seconds between attempts of every wait.
+rustfs_ready_delay: 5
+
+# Render-only mode: when true, skip host guards, install and service
+# management. Used by the 'render' Molecule scenario to validate templates
+# offline.
+rustfs_config_only: false

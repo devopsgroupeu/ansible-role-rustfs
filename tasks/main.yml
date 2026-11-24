@@ -1,0 +1,9 @@
+---
+# ==============================================================================
+# Orchestrator: include_tasks only, one tag per stage. Guards (validate) run
+# first and are tagged always, so no tag selection can bypass them.
+# ==============================================================================
+
+- name: Validate configuration variables
+  ansible.builtin.include_tasks: validate.yml
+  tags: always

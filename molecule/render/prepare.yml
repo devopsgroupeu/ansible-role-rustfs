@@ -1,0 +1,137 @@
+---
+# Prepare the render container without installing RustFS.
+# Bootstraps Python (plus curl for verify and python3-cryptography for
+# community.crypto), creates what the skipped install would have created (the
+# rustfs system group and user) and places BYO TLS material in /etc/rustfs/tls:
+# a test CA (ca.crt) and a node certificate for rustfs-render1 signed by it.
+# The node key is written root:root 0600 on purpose (wrong for the role), so
+# the role has to prove it enforces root:rustfs 0640.
+
+- name: Prepare render container
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Detect available package manager
+      ansible.builtin.raw: command -v apt-get >/dev/null 2>&1 && echo apt || echo dnf
+      register: __verify_pkg_mgr
+      changed_when: false
+
+    - name: Bootstrap Python and test tools (Debian/Ubuntu)
+      ansible.builtin.raw: >-
+        apt-get update -qq &&
+        apt-get install -y -qq --no-install-recommends python3 python3-apt curl python3-cryptography
+      changed_when: true
+      when: "'apt' in __verify_pkg_mgr['stdout']"
+
+    # EL images ship curl-minimal, which conflicts with the curl package and
+    # already provides /usr/bin/curl.
+    - name: Bootstrap Python and test tools (RHEL/Rocky)
+      ansible.builtin.raw: >-
+        dnf install -y python3 python3-cryptography &&
+        { command -v curl >/dev/null 2>&1 || dnf install -y curl; }
+      changed_when: true
+      when: "'dnf' in __verify_pkg_mgr['stdout']"
+
+    - name: Gather facts after bootstrap
+      ansible.builtin.setup:
+
+    - name: Create rustfs system group
+      ansible.builtin.group:
+        name: rustfs
+        system: true
+        state: present
+
+    - name: Create rustfs system user
+      ansible.builtin.user:
+        name: rustfs
+        group: rustfs
+        system: true
+        shell: /usr/sbin/nologin
+        home: /opt/rustfs
+        create_home: false
+        state: present
+
+    - name: Create the RustFS TLS directory
+      ansible.builtin.file:
+        path: /etc/rustfs/tls
+        state: directory
+        owner: root
+        group: rustfs
+        mode: "0750"
+
+    # The test CA key stays outside the TLS directory: in BYO mode the
+    # operator never places a CA key on the node.
+    - name: Generate the test CA private key
+      community.crypto.openssl_privatekey:
+        path: /root/rustfs-molecule-ca.key
+        type: ECC
+        curve: secp384r1
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Generate the test CA CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: /root/rustfs-molecule-ca.key
+        common_name: "RustFS Molecule CA"
+        use_common_name_for_san: false
+        basic_constraints:
+          - "CA:TRUE"
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+          - cRLSign
+          - digitalSignature
+        key_usage_critical: true
+      register: __verify_ca_csr
+      changed_when: false
+
+    - name: Self-sign the test CA certificate
+      community.crypto.x509_certificate:
+        path: /etc/rustfs/tls/ca.crt
+        csr_content: "{{ __verify_ca_csr['csr'] }}"
+        privatekey_path: /root/rustfs-molecule-ca.key
+        provider: selfsigned
+        selfsigned_not_before: "-1d"
+        selfsigned_not_after: "+3650d"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Generate the node private key
+      community.crypto.openssl_privatekey:
+        path: /etc/rustfs/tls/rustfs_key.pem
+        type: ECC
+        curve: secp384r1
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Generate the node CSR
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: /etc/rustfs/tls/rustfs_key.pem
+        common_name: rustfs-render1
+        use_common_name_for_san: false
+        subject_alt_name:
+          - "DNS:rustfs-render1"
+          - "DNS:localhost"
+          - "IP:127.0.0.1"
+        extended_key_usage:
+          - serverAuth
+        basic_constraints:
+          - "CA:FALSE"
+      register: __verify_node_csr
+      changed_when: false
+
+    - name: Sign the node certificate with the test CA
+      community.crypto.x509_certificate:
+        path: /etc/rustfs/tls/rustfs_cert.pem
+        csr_content: "{{ __verify_node_csr['csr'] }}"
+        provider: ownca
+        ownca_path: /etc/rustfs/tls/ca.crt
+        ownca_privatekey_path: /root/rustfs-molecule-ca.key
+        ownca_not_before: "-1d"
+        ownca_not_after: "+825d"
+        owner: root
+        group: root
+        mode: "0644"

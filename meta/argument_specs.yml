@@ -1,0 +1,335 @@
+---
+argument_specs:
+  main:
+    short_description: Install and configure RustFS S3-compatible object storage, single node or distributed
+    description: >
+      Installs RustFS from a checksum-verified, versioned release binary,
+      renders a non-secret env file, a root-only secrets file and a hardened
+      systemd unit, manages BYO or generated TLS, guards against unsafe
+      credentials and layout changes, and restarts a distributed
+      erasure-coded cluster one node at a time behind health gates.
+    author:
+      - DevOpsGroup
+    options:
+
+      # ---- Install ----
+      rustfs_version:
+        type: str
+        required: false
+        default: "1.0.6"
+        description: Pinned RustFS version, bare SemVer without a 'v' prefix.
+
+      rustfs_libc:
+        type: str
+        required: false
+        default: "musl"
+        choices: [musl, gnu]
+        description: >
+          Build flavour of the release asset. 'musl' is static; 'gnu' needs
+          glibc >= 2.31 and adds profiling support.
+
+      rustfs_arch:
+        type: str
+        required: false
+        default: "{{ {'x86_64': 'x86_64', 'amd64': 'x86_64', 'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(ansible_facts['architecture'], '') }}"
+        description: >
+          Arch token of the release asset. x86_64/aarch64 only; other
+          architectures resolve to '' and are rejected by validate.yml.
+
+      rustfs_download_base_url:
+        type: str
+        required: false
+        default: "https://github.com/rustfs/rustfs/releases/download"
+        description: >
+          Download base URL; the role appends /<version>/<asset>. A mirror
+          must keep that layout.
+
+      rustfs_checksum:
+        type: str
+        required: false
+        default: ""
+        description: >
+          Expected SHA-256 of the release zip (64 hex characters). Empty means
+          the pinned digest for the default version, else SHA256SUMS from the
+          same base URL.
+
+      rustfs_bin_dir:
+        type: str
+        required: false
+        default: "/usr/local/bin"
+        description: Directory for the versioned binary, the rustfs symlink and the temporary download directory.
+
+      rustfs_allow_downgrade:
+        type: bool
+        required: false
+        default: false
+        description: Allow installing a version lower than the installed one.
+
+      # ---- Paths / users ----
+      rustfs_user:
+        type: str
+        required: false
+        default: "rustfs"
+        description: Service user (system account, no login shell). Do not change it after the first bootstrap.
+
+      rustfs_group:
+        type: str
+        required: false
+        default: "rustfs"
+        description: Service group. Do not change it after the first bootstrap.
+
+      rustfs_home:
+        type: str
+        required: false
+        default: "/opt/rustfs"
+        description: Home and working directory of the service.
+
+      rustfs_config_dir:
+        type: str
+        required: false
+        default: "/etc/rustfs"
+        description: Directory that holds secrets.env and, by default, the TLS directory.
+
+      rustfs_env_file:
+        type: str
+        required: false
+        default: "/etc/default/rustfs"
+        description: Non-secret environment file read by the unit.
+
+      rustfs_tls_dir:
+        type: str
+        required: false
+        default: "{{ rustfs_config_dir }}/tls"
+        description: >
+          TLS directory. File names inside are fixed by RustFS
+          (rustfs_cert.pem, rustfs_key.pem, ca.crt).
+
+      # ---- Storage / topology ----
+      rustfs_volumes:
+        type: list
+        elements: str
+        required: false
+        default: []
+        description: >
+          REQUIRED. One upstream volume expression per server pool, identical
+          on every node, with three-dot ranges ({N...M}).
+
+      rustfs_data_dirs:
+        type: list
+        elements: str
+        required: false
+        default: "{{ __rustfs_volume_paths }}"
+        description: >
+          Local drive paths on this host. Derived from rustfs_volumes;
+          override per host only when pools use different paths.
+
+      rustfs_require_mounted_drives:
+        type: bool
+        required: false
+        default: true
+        description: >
+          Refuse to continue unless every data dir is a mount point, and make
+          the unit refuse to start on an unmounted drive. False only for
+          dev/test.
+
+      rustfs_allow_volumes_change:
+        type: bool
+        required: false
+        default: false
+        description: >
+          Allow RUSTFS_VOLUMES or RUSTFS_ERASURE_SET_DRIVE_COUNT to differ
+          from the deployed value (append or remove a pool only).
+
+      rustfs_unsupported_fs_policy:
+        type: str
+        required: false
+        default: "fail"
+        choices: [fail, warn]
+        description: What RustFS does when a drive sits on NFS, FUSE, overlayfs and similar.
+
+      rustfs_unsafe_bypass_disk_check:
+        type: bool
+        required: false
+        default: false
+        description: Skip the distinct-physical-disk check. Test environments only.
+
+      rustfs_cluster_hosts:
+        type: list
+        elements: str
+        required: false
+        default: "{{ (groups['rustfs'] | default([inventory_hostname])) if __rustfs_distributed else [inventory_hostname] }}"
+        description: >
+          Inventory hosts that form this node's cluster. Distributed mode
+          defaults to the rustfs group; a standalone node is its own cluster.
+
+      rustfs_node_address:
+        type: str
+        required: false
+        default: "{{ inventory_hostname if __rustfs_distributed else (__rustfs_listen_host if __rustfs_listen_host not in ['', '0.0.0.0', '::'] else 'localhost') }}"
+        description: >
+          Name or IP under which this node's S3 port is probed. In a cluster
+          it must be this node's host name in rustfs_volumes.
+
+      # ---- Listener / console ----
+      rustfs_address:
+        type: str
+        required: false
+        default: ":9000"
+        description: S3, admin, health and internode listener, [host]:port. Same port on every node.
+
+      rustfs_console_enabled:
+        type: bool
+        required: false
+        default: true
+        description: Serve the web console.
+
+      rustfs_console_address:
+        type: str
+        required: false
+        default: ":9001"
+        description: Console listener, [host]:port. Bind it to a management address or firewall it.
+
+      rustfs_server_domains:
+        type: list
+        elements: str
+        required: false
+        default: []
+        description: Domains for virtual-hosted-style requests. Empty means path-style only.
+
+      # ---- Credentials ----
+      rustfs_access_key:
+        type: str
+        required: false
+        default: ""
+        no_log: true
+        description: REQUIRED. Root access key (3 to 128 characters of A-Za-z0-9._-). Source it from Ansible Vault.
+
+      rustfs_secret_key:
+        type: str
+        required: false
+        default: ""
+        no_log: true
+        description: REQUIRED. Root secret key (at least 8 characters). Source it from Ansible Vault.
+
+      rustfs_rpc_secret:
+        type: str
+        required: false
+        default: ""
+        no_log: true
+        description: >
+          Internode RPC secret. REQUIRED in distributed mode and identical on
+          all nodes; changing it restarts the cluster together.
+
+      rustfs_iam_master_key:
+        type: str
+        required: false
+        default: ""
+        no_log: true
+        description: >
+          IAM master key (RUSTFS_IAM_MASTER_KEY, secrets.env only). REQUIRED
+          in distributed mode, recommended everywhere; at least 32 characters.
+
+      # ---- TLS ----
+      rustfs_tls_enabled:
+        type: bool
+        required: false
+        default: true
+        description: TLS on S3, console and internode traffic. Decide before the first bootstrap.
+
+      rustfs_tls_generate_certs:
+        type: bool
+        required: false
+        default: false
+        description: Generate a private CA and node certificates. Dev/test only.
+
+      rustfs_tls_cert_validity:
+        type: str
+        required: false
+        default: "+825d"
+        description: Validity of generated certificates.
+
+      rustfs_tls_extra_sans:
+        type: list
+        elements: str
+        required: false
+        default: []
+        description: Extra SANs for generated certificates, already prefixed (DNS:..., IP:...).
+
+      rustfs_tls_trust_system_ca:
+        type: bool
+        required: false
+        default: false
+        description: >
+          Trust the OS CA store for outbound and peer connections and for the
+          role's probes. When false, ca.crt in rustfs_tls_dir is required.
+
+      # ---- Logging / extra environment ----
+      rustfs_log_level:
+        type: str
+        required: false
+        default: "info"
+        choices: [trace, debug, info, warn, error]
+        description: Log level. Logs always go to journald.
+
+      rustfs_extra_env:
+        type: dict
+        required: false
+        default: {}
+        description: >
+          Extra non-secret variables rendered into the env file (string
+          values). Must be identical on every node of a cluster.
+
+      rustfs_extra_secret_env:
+        type: dict
+        required: false
+        default: {}
+        no_log: true
+        description: Extra secret variables rendered into secrets.env. Same rules as rustfs_extra_env.
+
+      # ---- systemd ----
+      rustfs_systemd_read_write_paths:
+        type: list
+        elements: str
+        required: false
+        default: []
+        description: Extra writable paths under the ProtectSystem=strict sandbox. Every path must exist.
+
+      # ---- Service control ----
+      rustfs_service_enabled:
+        type: bool
+        required: false
+        default: true
+        description: Enable the unit at boot.
+
+      rustfs_service_state:
+        type: str
+        required: false
+        default: "started"
+        choices: [started, stopped]
+        description: Desired service state.
+
+      rustfs_rolling_restart:
+        type: bool
+        required: false
+        default: true
+        description: >
+          Restart changed nodes one at a time with health gates. False
+          restarts all changed nodes together.
+
+      rustfs_ready_retries:
+        type: int
+        required: false
+        default: 60
+        description: Attempts for every wait (new main process, readiness, peer re-admission, cluster gate).
+
+      rustfs_ready_delay:
+        type: int
+        required: false
+        default: 5
+        description: Seconds between attempts of every wait.
+
+      rustfs_config_only:
+        type: bool
+        required: false
+        default: false
+        description: Render-only mode; skip host guards, install and service management.

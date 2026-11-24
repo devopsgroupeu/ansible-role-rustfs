@@ -1,0 +1,14 @@
+---
+# Converge for the offline render scenario. All scenario variables live in
+# provisioner.inventory.group_vars.rustfs of molecule.yml, so this play only
+# includes the role. Variant and negative plays live in verify.yml, so
+# idempotence re-runs only this plain converge.
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs

@@ -1,0 +1,115 @@
+---
+# Verify the render scenario without starting RustFS.
+# Play 1 includes the role with public: true (render mode), so the derived
+# __rustfs_* values and the validate facts are visible here, then asserts
+# them; task-level vars override the scenario group_vars per case.
+
+- name: Verify derived values
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include rustfs role with public vars
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+        public: true
+
+    - name: Assert derived values of the render layout
+      ansible.builtin.assert:
+        that:
+          - __rustfs_volume_paths | type_debug == 'list'
+          - __rustfs_volume_paths == ['/data/rustfs0', '/data/rustfs1', '/data/rustfs2', '/data/rustfs3']
+          - __rustfs_volume_hosts == ['rustfs-render1', 'rustfs-render2', 'rustfs-render3', 'rustfs-render4']
+          - rustfs_data_dirs == __rustfs_volume_paths
+          - __rustfs_distributed | bool
+          - __rustfs_port == '9000'
+          - rustfs_node_address == 'rustfs-render1'
+          - __rustfs_node_url == 'https://rustfs-render1:9000'
+          - __rustfs_peer_urls | map(attribute='name') | list == ['rustfs-render2', 'rustfs-render3', 'rustfs-render4']
+          - __rustfs_peer_urls[0]['url'] == 'https://rustfs-render2:9000'
+          - (__rustfs_env | list)[0] == 'RUSTFS_VOLUMES'
+          - __rustfs_env['RUSTFS_TLS_RELOAD_ENABLE'] == 'true'
+          - __rustfs_env['RUSTFS_OBS_LOG_STDOUT_ENABLED'] == 'true'
+          - "'RUSTFS_UNSAFE_BYPASS_DISK_CHECK' not in __rustfs_env"
+          - __rustfs_managed_keys.split(',') | length == (__rustfs_env | length) + (__rustfs_secret_env | length) + 2
+          - __rustfs_capabilities == ''
+        fail_msg: "derived values of the render layout are wrong"
+
+    - name: Assert the IAM master key reaches the secret env only
+      ansible.builtin.assert:
+        that:
+          - (__rustfs_secret_env | list)[:4] == ['RUSTFS_ACCESS_KEY', 'RUSTFS_SECRET_KEY', 'RUSTFS_RPC_SECRET', 'RUSTFS_IAM_MASTER_KEY']
+          - "'RUSTFS_IAM_MASTER_KEY_OLD_KEYS' in __rustfs_secret_env"
+          - "'RUSTFS_IAM_MASTER_KEY' not in __rustfs_env"
+          - "'RUSTFS_IAM_MASTER_KEY' in __rustfs_reserved_env"
+        fail_msg: "RUSTFS_IAM_MASTER_KEY is not rendered from rustfs_iam_master_key into the secret env"
+
+    - name: Assert no IAM master key without the variable
+      vars:
+        rustfs_iam_master_key: ""
+      ansible.builtin.assert:
+        that: "'RUSTFS_IAM_MASTER_KEY' not in __rustfs_secret_env"
+        fail_msg: "an empty rustfs_iam_master_key still renders RUSTFS_IAM_MASTER_KEY"
+
+    - name: Assert zero padding and pool de-duplication
+      vars:
+        rustfs_volumes:
+          - "https://n{01...04}.example.com/mnt/disk{01...12}"
+          - "https://n{05...08}.example.com/mnt/disk{01...12}"
+      ansible.builtin.assert:
+        that:
+          - __rustfs_volume_paths | length == 12
+          - __rustfs_volume_paths[0] == '/mnt/disk01'
+          - __rustfs_volume_paths[-1] == '/mnt/disk12'
+          - __rustfs_volume_hosts | length == 8
+          - __rustfs_volume_hosts[0] == 'n01.example.com'
+          - __rustfs_volume_hosts[-1] == 'n08.example.com'
+        fail_msg: "zero-padded ranges or pool de-duplication are wrong"
+
+    - name: Assert explicit checksum wins
+      vars:
+        rustfs_checksum: "{{ 'a' * 64 }}"
+      ansible.builtin.assert:
+        that: __rustfs_checksum_arg == 'sha256:' ~ ('a' * 64)
+        fail_msg: "rustfs_checksum does not take precedence: {{ __rustfs_checksum_arg }}"
+
+    - name: Assert pinned digest for the default version
+      ansible.builtin.assert:
+        that:
+          - rustfs_arch in ['x86_64', 'aarch64']
+          - __rustfs_checksum_arg == 'sha256:' ~ __rustfs_checksums['1.0.6'][rustfs_arch ~ '-musl']
+          - __rustfs_download_url == 'https://github.com/rustfs/rustfs/releases/download/1.0.6/rustfs-linux-' ~ rustfs_arch ~ '-musl-v1.0.6.zip'
+        fail_msg: "pinned digest or download URL of the default version is wrong: {{ __rustfs_checksum_arg }} {{ __rustfs_download_url }}"
+
+    - name: Assert SHA256SUMS fallback on a mirror
+      vars:
+        rustfs_version: "1.0.5"
+        rustfs_download_base_url: "https://mirror.example.com/rustfs"
+      ansible.builtin.assert:
+        that: __rustfs_checksum_arg == 'sha256:https://mirror.example.com/rustfs/1.0.5/SHA256SUMS'
+        fail_msg: "SHA256SUMS fallback is wrong: {{ __rustfs_checksum_arg }}"
+
+    - name: Assert node address default for a bound listener
+      vars:
+        rustfs_volumes: ["/data/rustfs0"]
+        rustfs_address: "127.0.0.2:9000"
+      ansible.builtin.assert:
+        that: rustfs_node_address == '127.0.0.2'
+        fail_msg: "rustfs_node_address for a bound listener is {{ rustfs_node_address }}"
+
+    - name: Assert node address default for a bound IPv6 listener
+      vars:
+        rustfs_volumes: ["/data/rustfs0"]
+        rustfs_address: "[::1]:9000"
+      ansible.builtin.assert:
+        that:
+          - rustfs_node_address == '::1'
+          - __rustfs_node_is_ip | bool
+        fail_msg: "rustfs_node_address for a bound IPv6 listener is {{ rustfs_node_address }}"
+
+    - name: Assert localhost for a wildcard listener
+      vars:
+        rustfs_volumes: ["/data/rustfs0"]
+      ansible.builtin.assert:
+        that: rustfs_node_address == 'localhost'
+        fail_msg: "rustfs_node_address for a wildcard listener is {{ rustfs_node_address }}"

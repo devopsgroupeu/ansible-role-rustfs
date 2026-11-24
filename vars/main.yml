@@ -1,0 +1,216 @@
+---
+# ==============================================================================
+# Internal values and derived values (not overridable by consumers)
+# Prefix __rustfs_ marks these as internal role variables.
+# Unlike the house OS-family-only vars files, this role also keeps every
+# derived value here, so tasks and templates never repeat an expression and
+# the env files and the restart decision read the same dictionaries.
+# Every expression with a regex is a folded scalar. Back-references inside
+# {% %} statements are written '\\1' (there '\1' would become \x01); inside
+# {{ }} Ansible doubles backslashes in string constants, so no {{ }}
+# expression here uses a back-reference.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# OS-family maps
+# ------------------------------------------------------------------------------
+
+# Package dependencies installed before the binary download.
+# python3-cryptography is needed by community.crypto (TLS generation and the
+# BYO certificate checks).
+__rustfs_pkg_deps:
+  Debian:
+    - unzip
+    - ca-certificates
+    - python3-cryptography
+  RedHat:
+    - unzip
+    - ca-certificates
+    - python3-cryptography
+
+# ------------------------------------------------------------------------------
+# Install
+# ------------------------------------------------------------------------------
+
+# Pinned SHA-256 digests of the release zips of the default version, from the
+# upstream SHA256SUMS. Replace this map together with rustfs_version in
+# defaults/main.yml (CONTRIBUTING, "Bumping the RustFS version").
+__rustfs_checksums:
+  "1.0.6":
+    x86_64-musl: "a4d109a09857c04bf5d11b2cec0fbbf0887819b9392e5d46d7d153dae6a1398f"
+    aarch64-musl: "dcbe86dbb0c521cb6738f72bb36a2d056866667d3d137c2118ee7e2cc9475855"
+    x86_64-gnu: "4f0bf3fecbe861467427ff506aee22c302cfd5ac8b7dcbde71714f8e5e680dea"
+    aarch64-gnu: "fde8485aa2580ad774ba8588b0b51b68790ff28677fb27024ea68d8ab2be8e00"
+
+# Release asset file name.
+__rustfs_asset: "rustfs-linux-{{ rustfs_arch }}-{{ rustfs_libc }}-v{{ rustfs_version }}.zip"
+
+# Full download URL of the release asset.
+__rustfs_download_url: "{{ rustfs_download_base_url }}/{{ rustfs_version }}/{{ __rustfs_asset }}"
+
+# get_url checksum argument. Resolution order: rustfs_checksum, then the
+# pinned digest of the default version, then SHA256SUMS next to the asset.
+__rustfs_checksum_arg: >-
+  {{ 'sha256:' ~ (rustfs_checksum if rustfs_checksum | length > 0
+                  else ((__rustfs_checksums[rustfs_version] | default({}))[rustfs_arch ~ '-' ~ rustfs_libc]
+                        | default(rustfs_download_base_url ~ '/' ~ rustfs_version ~ '/SHA256SUMS'))) }}
+
+# Versioned binary the symlink points to.
+__rustfs_versioned_bin: "{{ rustfs_bin_dir }}/rustfs-{{ rustfs_version }}-{{ rustfs_libc }}"
+
+# Stable binary path (symlink) used by the unit.
+__rustfs_bin: "{{ rustfs_bin_dir }}/rustfs"
+
+# ------------------------------------------------------------------------------
+# Files
+# ------------------------------------------------------------------------------
+
+__rustfs_unit_file: "/etc/systemd/system/rustfs.service"
+
+__rustfs_secrets_file: "{{ rustfs_config_dir }}/secrets.env"
+
+# File names inside the TLS directory are fixed by the RustFS binary.
+__rustfs_tls_cert_file: "{{ rustfs_tls_dir }}/rustfs_cert.pem"
+
+__rustfs_tls_key_file: "{{ rustfs_tls_dir }}/rustfs_key.pem"
+
+__rustfs_tls_ca_file: "{{ rustfs_tls_dir }}/ca.crt"
+
+# Generated mode only: the private CA key.
+__rustfs_tls_ca_key_file: "{{ rustfs_tls_dir }}/ca.key"
+
+# ------------------------------------------------------------------------------
+# Topology and listener
+# ------------------------------------------------------------------------------
+
+# Distributed mode: the volumes are URLs (validate.yml refuses a mix).
+__rustfs_distributed: "{{ (rustfs_volumes | first | default('')) is match('^https?://') }}"
+
+__rustfs_scheme: "{{ 'https' if rustfs_tls_enabled | bool else 'http' }}"
+
+# S3 port (string) from rustfs_address.
+__rustfs_port: "{{ rustfs_address | regex_replace('^.*:', '') }}"
+
+# Console port (string) from rustfs_console_address.
+__rustfs_console_port: "{{ rustfs_console_address | regex_replace('^.*:', '') }}"
+
+# Host part of rustfs_address without the port and without IPv6 brackets;
+# "" for a wildcard listener such as ":9000". Strips the brackets instead of
+# using a back-reference: inside {{ }} Ansible doubles backslashes in string
+# constants, so '\\1' would be a literal "\1" here.
+__rustfs_listen_host: >-
+  {{ rustfs_address | regex_replace(':\d+$', '') | regex_replace('^\[|\]$', '') }}
+
+# rustfs_node_address is an IPv4 or IPv6 literal (no ansible.utils needed).
+__rustfs_node_is_ip: >-
+  {{ (rustfs_node_address is match('^(\d{1,3}\.){3}\d{1,3}$')) or (':' in rustfs_node_address) }}
+
+# RUSTFS_VOLUMES value.
+__rustfs_volumes_string: "{{ rustfs_volumes | join(' ') }}"
+
+# Expansion of the path part of every volume item, de-duplicated across
+# pools. Zero padding follows upstream: {01...12} gives 01 to 12.
+__rustfs_volume_paths: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for vol in rustfs_volumes -%}
+  {%-   set part = vol | regex_replace('^https?://[^/]+', '') -%}
+  {%-   set m = part | regex_search('^(.*)\{(\d+)\.\.\.(\d+)\}(.*)$', '\\1', '\\2', '\\3', '\\4') -%}
+  {%-   if m -%}
+  {%-     set width = (m[2] | length) if (m[1] is match('^0\d')) else 0 -%}
+  {%-     for i in range(m[1] | int, (m[2] | int) + 1) -%}
+  {%-       set ns.out = ns.out + [m[0] ~ ('%0*d' | format(width, i)) ~ m[3]] -%}
+  {%-     endfor -%}
+  {%-   else -%}
+  {%-     set ns.out = ns.out + [part] -%}
+  {%-   endif -%}
+  {%- endfor -%}
+  {{ ns.out | unique }}
+
+# Expansion of the host part of every URL volume item, without the port.
+__rustfs_volume_hosts: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for vol in rustfs_volumes if vol is match('^https?://') -%}
+  {%-   set part = vol | regex_replace('^https?://([^/]+).*$', '\\1')
+                       | regex_replace('^(\[[^\]]+\]|[^:]+)(:\d+)?$', '\\1') -%}
+  {%-   set m = part | regex_search('^(.*)\{(\d+)\.\.\.(\d+)\}(.*)$', '\\1', '\\2', '\\3', '\\4') -%}
+  {%-   if m -%}
+  {%-     set width = (m[2] | length) if (m[1] is match('^0\d')) else 0 -%}
+  {%-     for i in range(m[1] | int, (m[2] | int) + 1) -%}
+  {%-       set ns.out = ns.out + [m[0] ~ ('%0*d' | format(width, i)) ~ m[3]] -%}
+  {%-     endfor -%}
+  {%-   else -%}
+  {%-     set ns.out = ns.out + [part] -%}
+  {%-   endif -%}
+  {%- endfor -%}
+  {{ ns.out | unique }}
+
+# Ambient and bounding capability: only when a listener port is privileged.
+__rustfs_capabilities: >-
+  {{ 'CAP_NET_BIND_SERVICE'
+     if (__rustfs_port | int < 1024) or (rustfs_console_enabled | bool and __rustfs_console_port | int < 1024)
+     else '' }}
+
+# ------------------------------------------------------------------------------
+# Environment
+# ------------------------------------------------------------------------------
+
+# Non-secret environment, in env file order (rustfs_env_file).
+__rustfs_env: >-
+  {{ {'RUSTFS_VOLUMES': __rustfs_volumes_string,
+      'RUSTFS_ADDRESS': rustfs_address,
+      'RUSTFS_CONSOLE_ENABLE': rustfs_console_enabled | bool | lower}
+     | combine({'RUSTFS_CONSOLE_ADDRESS': rustfs_console_address} if rustfs_console_enabled | bool else {})
+     | combine({'RUSTFS_SERVER_DOMAINS': rustfs_server_domains | join(',')} if rustfs_server_domains | length > 0 else {})
+     | combine({'RUSTFS_TLS_PATH': rustfs_tls_dir,
+                'RUSTFS_TLS_RELOAD_ENABLE': 'true',
+                'RUSTFS_TRUST_SYSTEM_CA': rustfs_tls_trust_system_ca | bool | lower} if rustfs_tls_enabled | bool else {})
+     | combine({'RUSTFS_OBS_LOGGER_LEVEL': rustfs_log_level,
+                'RUSTFS_OBS_LOG_STDOUT_ENABLED': 'true',
+                'RUSTFS_CHECK_UPDATE': 'false',
+                'RUSTFS_UNSUPPORTED_FS_POLICY': rustfs_unsupported_fs_policy})
+     | combine({'RUSTFS_UNSAFE_BYPASS_DISK_CHECK': 'true'} if rustfs_unsafe_bypass_disk_check | bool else {})
+     | combine(dict(rustfs_extra_env | dictsort)) }}
+
+# Secret environment (secrets.env only, root:root 0600).
+__rustfs_secret_env: >-
+  {{ {'RUSTFS_ACCESS_KEY': rustfs_access_key, 'RUSTFS_SECRET_KEY': rustfs_secret_key}
+     | combine({'RUSTFS_RPC_SECRET': rustfs_rpc_secret} if rustfs_rpc_secret | length > 0 else {})
+     | combine({'RUSTFS_IAM_MASTER_KEY': rustfs_iam_master_key} if rustfs_iam_master_key | length > 0 else {})
+     | combine(dict(rustfs_extra_secret_env | dictsort)) }}
+
+# Sorted, comma-joined names of every managed key plus the two marker names
+# (ANSIBLE_RUSTFS_MANAGED_KEYS in the env file), so a removed key changes it.
+__rustfs_managed_keys: >-
+  {{ ((__rustfs_env | list) + (__rustfs_secret_env | list)
+      + ['ANSIBLE_RUSTFS_MANAGED_KEYS', 'ANSIBLE_RUSTFS_UNIT_SHA256']) | sort | join(',') }}
+
+# Env names the role owns; refused as keys of rustfs_extra_env and
+# rustfs_extra_secret_env. RUSTFS_IAM_MASTER_KEY_OLD_KEYS stays allowed in
+# rustfs_extra_secret_env for key rotation.
+__rustfs_reserved_env:
+  - RUSTFS_VOLUMES
+  - RUSTFS_ADDRESS
+  - RUSTFS_CONSOLE_ENABLE
+  - RUSTFS_CONSOLE_ADDRESS
+  - RUSTFS_SERVER_DOMAINS
+  - RUSTFS_ACCESS_KEY
+  - RUSTFS_SECRET_KEY
+  - RUSTFS_ACCESS_KEY_FILE
+  - RUSTFS_SECRET_KEY_FILE
+  - RUSTFS_ROOT_USER
+  - RUSTFS_ROOT_PASSWORD
+  - RUSTFS_RPC_SECRET
+  - RUSTFS_IAM_MASTER_KEY
+  - RUSTFS_TLS_PATH
+  - RUSTFS_TLS_RELOAD_ENABLE
+  - RUSTFS_TRUST_SYSTEM_CA
+  - RUSTFS_TLS_KEYLOG
+  - RUSTFS_SERVER_MTLS_ENABLE
+  - RUSTFS_OBS_LOGGER_LEVEL
+  - RUSTFS_OBS_LOG_STDOUT_ENABLED
+  - RUSTFS_CHECK_UPDATE
+  - RUSTFS_UNSUPPORTED_FS_POLICY
+  - RUSTFS_UNSAFE_BYPASS_DISK_CHECK
+  - RUSTFS_HEALTH_ENDPOINT_ENABLE
+  - RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE
+  - RUST_LOG

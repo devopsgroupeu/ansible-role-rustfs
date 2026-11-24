@@ -1,0 +1,39 @@
+---
+# ==============================================================================
+# Variable and play-shape validation. Runs at the start of every play, in
+# render mode too (tag: always). Fail closed: nothing on the host is touched
+# before these rules pass.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Per-host facts for the rollout (rule 23, no assert, every mode)
+# ------------------------------------------------------------------------------
+
+# Facts, not vars: only facts are visible to the other hosts through hostvars.
+# An IPv6 literal is bracketed in the URL.
+- name: Set the probe URL of this node
+  ansible.builtin.set_fact:
+    __rustfs_node_url: >-
+      {{ __rustfs_scheme ~ '://'
+         ~ (('[' ~ rustfs_node_address ~ ']') if ':' in rustfs_node_address else rustfs_node_address)
+         ~ ':' ~ __rustfs_port }}
+  tags: always
+
+# Every other cluster host as {name, url}; empty for a standalone node. Hosts
+# outside the play (day-2 --limit) have no __rustfs_node_url fact, so their
+# URL is built from their inventory rustfs_node_address, else their name.
+- name: Set the probe URLs of the cluster peers
+  ansible.builtin.set_fact:
+    __rustfs_peer_urls: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for peer in rustfs_cluster_hosts if peer != inventory_hostname -%}
+      {%-   if peer in hostvars and hostvars[peer]['__rustfs_node_url'] is defined -%}
+      {%-     set url = hostvars[peer]['__rustfs_node_url'] -%}
+      {%-   else -%}
+      {%-     set addr = (hostvars[peer]['rustfs_node_address'] | default(peer)) if peer in hostvars else peer -%}
+      {%-     set url = __rustfs_scheme ~ '://' ~ (('[' ~ addr ~ ']') if ':' in addr else addr) ~ ':' ~ __rustfs_port -%}
+      {%-   endif -%}
+      {%-   set ns.out = ns.out + [{'name': peer, 'url': url}] -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  tags: always

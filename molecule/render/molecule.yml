@@ -1,0 +1,87 @@
+---
+# Offline render scenario: rustfs_config_only is true, so the role renders
+# and validates without installing a binary or starting a service. The
+# platform is named rustfs-render1 so that it is a member of the distributed
+# layout below and rustfs_node_address keeps its default (inventory_hostname).
+# rustfs-render2 to rustfs-render4 are fake cluster members: only their count
+# and names are used in render mode.
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: rustfs-render1
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+    group_vars:
+      rustfs:
+        # Render only: no binary, no service.
+        rustfs_config_only: true
+        # Distributed TLS layout: 4 nodes x 4 drives, this host is node 1.
+        rustfs_volumes:
+          - "https://rustfs-render{1...4}:9000/data/rustfs{0...3}"
+        # Explicit cluster members; only rustfs-render1 exists.
+        rustfs_cluster_hosts:
+          - rustfs-render1
+          - rustfs-render2
+          - rustfs-render3
+          - rustfs-render4
+        # Container: data dirs are plain directories, not mount points.
+        rustfs_require_mounted_drives: false
+        # Test root access key (the default "" is refused).
+        rustfs_access_key: "MOLECULEADMIN"
+        # Test root secret key (the default "" is refused).
+        rustfs_secret_key: "molecule-secret-key-0123456789"
+        # Distributed mode requires an RPC secret.
+        rustfs_rpc_secret: "molecule-rpc-secret-0123456789"
+        # Distributed mode requires an IAM master key.
+        rustfs_iam_master_key: "molecule-iam-master-key-0123456789"
+        # One extra non-secret item, rendered into the env file.
+        rustfs_extra_env:
+          RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE: "bounded"
+        # One extra secret item (the rotation key list stays allowed here).
+        rustfs_extra_secret_env:
+          RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "molecule-old-iam-master-key-0123456789"
+        # One extra writable path for the systemd sandbox.
+        rustfs_systemd_read_write_paths:
+          - "/var/lib/rustfs-extra"
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - verify
+    - cleanup
+    - destroy
