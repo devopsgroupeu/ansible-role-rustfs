@@ -1,0 +1,43 @@
+---
+galaxy_info:
+  author: DevOpsGroup
+  company: DevOpsGroup s.r.o
+  description: >
+    Production-ready Ansible role for installing and configuring RustFS
+    S3-compatible object storage as a single node or a distributed
+    erasure-coded cluster with TLS, systemd hardening and health-gated
+    rolling restarts.
+
+  license: Apache-2.0
+  min_ansible_version: "2.19"
+
+  role_name: rustfs
+  namespace: devopsgroupeu
+
+  galaxy_tags:
+    - rustfs
+    - s3
+    - objectstorage
+    - storage
+    - erasurecoding
+    - distributed
+    - cluster
+    - ha
+    - tls
+    - systemd
+    - backup
+    - selfhosted
+
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+    - name: EL
+      versions:
+        - "9"
+
+dependencies: []
