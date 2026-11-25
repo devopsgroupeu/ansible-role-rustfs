@@ -362,13 +362,24 @@ molecule test -s distributed
 MOLECULE_DISTRO=ubuntu2404 molecule test -s default
 ```
 
-The CI pipeline (`ci.yml`) runs on every push and pull request: `yamllint`
-and `ansible-lint --profile production`; `render` and `default` on
-`debian12`, `debian13` and `ubuntu2404`; `upgrade` and `distributed` on
-`debian12`. On `default`/`debian12` it also fails when a test secret
-appears in the Molecule log, and runs a check-mode converge that must report
-`changed=0`. A single `ci-success` job aggregates the results. EL 9 is
-declared in `meta/main.yml`; test it with
+The CI pipeline (`ci.yml`) runs on pushes and pull requests to `main` and
+`develop`. The `lint` job runs `yamllint`,
+`ansible-lint --profile production` on the role and on the Molecule and
+example playbooks, and the variable count and ASCII checks of
+[CONTRIBUTING.md](CONTRIBUTING.md). The `molecule` job runs `render` and
+`default` on `debian12`, `debian13` and `ubuntu2404`, and `upgrade` on
+`debian12`. On `default`/`debian12` it keeps
+the container, fails when a test secret appears in the Molecule log, and runs
+a check-mode converge (`--check --diff`) of the converged host that must
+report `changed=0` and `failed=0` and print no secret. The
+`molecule-distributed` job runs `distributed` on `debian12`. A single
+`ci-success` job aggregates the results.
+
+EL 9 is declared in `meta/main.yml` but not yet validated. On the
+`rockylinux9` image the role converges, stays idempotent and passes check
+mode and every `default` verify assert except the S3 round trip: the image's
+curl 7.76.1 cannot sign SigV4 requests that RustFS accepts
+(`SignatureDoesNotMatch`). Reproduce with
 `MOLECULE_DISTRO=rockylinux9 molecule test -s default`.
 
 ---

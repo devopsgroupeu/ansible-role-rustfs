@@ -1,0 +1,184 @@
+---
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          ansible-galaxy collection install -r requirements.yml
+      - name: yamllint
+        run: yamllint .
+      - name: ansible-lint
+        run: ansible-lint --profile production .
+      - name: ansible-lint (Molecule and example playbooks)
+        # The role lint above does not process molecule/ and examples/. The
+        # Molecule playbooks name the role by its directory, which sits in the
+        # parent of the checkout.
+        run: >-
+          ansible-lint --profile production
+          molecule/*/*.yml molecule/*/tasks/*.yml
+          examples/*.yml examples/inventory/*.yml
+        env:
+          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/..
+      - name: Drift gates
+        # CONTRIBUTING "Variable count check" and "ASCII check": defaults,
+        # argument specs and docs/CONFIGURATION.md list the same variables,
+        # and every tracked file uses ASCII punctuation only.
+        run: |
+          diff <(grep -oE '^rustfs_[a-z0-9_]+' defaults/main.yml | sort) \
+               <(grep -oE '^      rustfs_[a-z0-9_]+:' meta/argument_specs.yml | tr -d ' :' | sort)
+          # shellcheck disable=SC2016  # the backticks are literal markdown
+          diff <(grep -oE '^rustfs_[a-z0-9_]+' defaults/main.yml | sort) \
+               <(grep -oE '^\| `rustfs_[a-z0-9_]+`' docs/CONFIGURATION.md | grep -oE 'rustfs_[a-z0-9_]+' | sort)
+          # shellcheck disable=SC2016  # perl variables, not shell
+          git ls-files -z | xargs -0 perl -ne 'if (/[^\x00-\x7F]/) { print "$ARGV:$.\n"; $bad = 1 } close ARGV if eof; END { exit($bad ? 1 : 0) }'
+
+  molecule:
+    name: molecule / ${{ matrix.scenario }} / ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      # Single-container scenarios. The four-node distributed scenario is a
+      # separate job. extra_checks keeps the default/debian12 container after
+      # the test for a secret grep of the log and a check-mode converge.
+      matrix:
+        include:
+          # render scenario - offline, no RustFS binary, guard refusals
+          - scenario: render
+            distro: debian12
+          - scenario: render
+            distro: debian13
+          - scenario: render
+            distro: ubuntu2404
+          # default scenario - install, start, S3 round trip, behaviour plays
+          - scenario: default
+            distro: debian12
+            extra_checks: true
+          - scenario: default
+            distro: debian13
+          - scenario: default
+            distro: ubuntu2404
+          # upgrade scenario - upgrade, downgrade refusal and rollback
+          - scenario: upgrade
+            distro: debian12
+    env:
+      PY_COLORS: "1"
+      ANSIBLE_FORCE_COLOR: "1"
+      MOLECULE_DISTRO: ${{ matrix.distro }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          ansible-galaxy collection install -r requirements.yml
+      - name: Run Molecule scenario
+        run: |
+          set -o pipefail
+          molecule test -s "${{ matrix.scenario }}" --destroy "${{ matrix.extra_checks && 'never' || 'always' }}" 2>&1 | tee molecule.log
+      # The gates below use an explicit if: bash -e ignores the exit status
+      # of a command negated with '!' unless it is the last one.
+      - name: Fail if a test secret is in the Molecule log
+        if: matrix.extra_checks
+        run: |
+          if grep -n -F -e MOLECULEADMIN -e "molecule-secret \$#'key-0123456789" \
+               -e molecule-rpc-secret-0123456789 -e molecule-iam-master-key-0123456789 molecule.log; then
+            echo "A test secret appears in molecule.log; add no_log to the task that printed it"
+            exit 1
+          fi
+      - name: Check-mode converge of the converged host
+        if: matrix.extra_checks
+        run: |
+          set -o pipefail
+          molecule converge -s default -- --check --diff 2>&1 | tee check.log
+      - name: Fail unless the check-mode recap shows no change and no failure
+        if: matrix.extra_checks
+        run: |
+          if ! grep -E 'changed=0 +unreachable=0 +failed=0' check.log; then
+            echo "The check-mode converge of the converged host reported a change or a failure"
+            exit 1
+          fi
+      - name: Fail if a test secret is in the check-mode log
+        if: matrix.extra_checks
+        run: |
+          if grep -n -F -e MOLECULEADMIN -e "molecule-secret \$#'key-0123456789" \
+               -e molecule-rpc-secret-0123456789 -e molecule-iam-master-key-0123456789 check.log; then
+            echo "A test secret appears in check.log; add no_log to the task that printed it"
+            exit 1
+          fi
+      - name: Destroy the default scenario
+        if: always() && matrix.extra_checks
+        run: molecule destroy -s default
+
+  molecule-distributed:
+    # Four-node erasure-coded cluster: parallel bootstrap, rolling and
+    # together restarts, dead peer, idempotence. Runs on every push and pull
+    # request (about 10 minutes, four release downloads).
+    name: molecule / distributed / debian12
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      PY_COLORS: "1"
+      ANSIBLE_FORCE_COLOR: "1"
+      MOLECULE_DISTRO: debian12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          ansible-galaxy collection install -r requirements.yml
+      - name: Run distributed Molecule scenario
+        run: molecule test -s distributed
+
+  ci-success:
+    name: ci-success
+    runs-on: ubuntu-latest
+    # No required job is conditional, so a skipped one (its lint dependency
+    # failed) also fails this check.
+    needs: [lint, molecule, molecule-distributed]
+    if: always()
+    steps:
+      - name: Fail if any required job did not succeed
+        if: >-
+          ${{ contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+          || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "A required CI job (lint, molecule or molecule-distributed) did not succeed."
+          exit 1
+      - name: Confirm required jobs passed
+        run: echo "lint + molecule + molecule-distributed succeeded"
