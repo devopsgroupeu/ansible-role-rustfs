@@ -1,0 +1,59 @@
+---
+# Distributed side_effect helper: reads when the rustfs unit last started and
+# how often it started since an earlier read. Input:
+#   __verify_since  "now" of an earlier read ('' counts nothing)
+# Output:
+#   __verify_unit  {pid, stop, start, active, starts, now}
+#     pid     main PID (int, 0 while not running)
+#     stop    ActiveExitTimestampMonotonic: the unit left the active state
+#             (a stop or the stop half of a restart began)
+#     start   ExecMainStartTimestampMonotonic: the main process started
+#     active  ActiveEnterTimestampMonotonic: the unit became active (READY=1)
+#     starts  unit-started journal entries since __verify_since (int)
+#     now     wall clock of this read (epoch seconds with microseconds), for
+#             the next read
+# Timestamps are CLOCK_MONOTONIC microseconds (int). The containers share the
+# Docker host kernel, so they are comparable across nodes.
+# The journal is filtered by time, not by cursor: journalctl 252 returns
+# nothing for --after-cursor combined with field matches when the cursor
+# entry itself does not match.
+
+# Taken first, so a start between this read and the next is counted there.
+- name: Read the wall clock
+  ansible.builtin.command: date +%s.%6N
+  register: __verify_unit_now
+  changed_when: false
+
+# A read-only property query.
+- name: Read the main PID and the timestamps of the rustfs unit
+  ansible.builtin.command: systemctl show rustfs --property=MainPID --property=ActiveExitTimestampMonotonic --property=ExecMainStartTimestampMonotonic --property=ActiveEnterTimestampMonotonic # noqa: command-instead-of-module
+  register: __verify_unit_show
+  changed_when: false
+
+# systemd logs one entry with this MESSAGE_ID each time a start (or the
+# start half of a restart, an automatic restart included) finished.
+- name: Count the starts of the rustfs unit since the earlier read
+  ansible.builtin.command:
+    argv:
+      - journalctl
+      - --quiet
+      - --no-pager
+      - --output=cat
+      - "--since=@{{ __verify_since }}"
+      - UNIT=rustfs.service
+      - MESSAGE_ID=39f53479d3a045ac8e11786248231fbf
+  register: __verify_unit_starts
+  changed_when: false
+  when: __verify_since | length > 0
+
+- name: Collect the unit times
+  vars:
+    __verify_props: "{{ dict(__verify_unit_show['stdout_lines'] | map('split', '=', 1)) }}"
+  ansible.builtin.set_fact:
+    __verify_unit:
+      pid: "{{ __verify_props['MainPID'] | int }}"
+      stop: "{{ __verify_props['ActiveExitTimestampMonotonic'] | int }}"
+      start: "{{ __verify_props['ExecMainStartTimestampMonotonic'] | int }}"
+      active: "{{ __verify_props['ActiveEnterTimestampMonotonic'] | int }}"
+      starts: "{{ __verify_unit_starts['stdout_lines'] | default([]) | length }}"
+      now: "{{ __verify_unit_now['stdout'] | trim }}"

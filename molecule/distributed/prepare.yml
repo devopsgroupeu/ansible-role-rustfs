@@ -1,0 +1,82 @@
+---
+# Prepare the four distributed containers before the role runs.
+# Play 1 bootstraps Python plus curl (S3 requests in side_effect and verify)
+# and openssl (certificate check in verify). Nothing RustFS-specific: the
+# role creates the user, installs its package dependencies and the binary.
+# Plays 2 and 3 test preflight P7 while the hosts are still empty: a first
+# bootstrap that runs on three of the four cluster hosts must be refused
+# before anything is written, so no host has an env file afterwards.
+
+- name: Prepare distributed containers
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Detect available package manager
+      ansible.builtin.raw: command -v apt-get >/dev/null 2>&1 && echo apt || echo dnf
+      register: __verify_pkg_mgr
+      changed_when: false
+
+    - name: Bootstrap Python and test tools (Debian/Ubuntu)
+      ansible.builtin.raw: >-
+        apt-get update -qq &&
+        apt-get install -y -qq --no-install-recommends python3 python3-apt curl openssl
+      changed_when: true
+      when: "'apt' in __verify_pkg_mgr['stdout']"
+
+    # EL images ship curl-minimal, which conflicts with the curl package and
+    # already provides /usr/bin/curl.
+    - name: Bootstrap Python and test tools (RHEL/Rocky)
+      ansible.builtin.raw: >-
+        dnf install -y python3 openssl &&
+        { command -v curl >/dev/null 2>&1 || dnf install -y curl; }
+      changed_when: true
+      when: "'dnf' in __verify_pkg_mgr['stdout']"
+
+# P7 (spec 5.2): rustfs-node4 is a cluster host (rustfs_cluster_hosts is the
+# rustfs group) but not in this play, and no host has the env file yet.
+- name: "Prepare: a first bootstrap without every cluster host is refused"
+  hosts: rustfs-node1,rustfs-node2,rustfs-node3
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role bootstrapped a cluster without rustfs-node4"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "the cluster hosts ['rustfs-node4'] are not in the play"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+- name: "Prepare: the refused bootstrap wrote nothing"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stat the env file and the rustfs symlink
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+      loop:
+        - /etc/default/rustfs
+        - /usr/local/bin/rustfs
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_fresh
+
+    - name: Assert no host has the env file or the binary
+      ansible.builtin.assert:
+        that:
+          - __verify_fresh['results'] | selectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          the refused bootstrap left
+          {{ __verify_fresh['results'] | selectattr('stat.exists') | map(attribute='item') | list }}
+          on {{ inventory_hostname }}

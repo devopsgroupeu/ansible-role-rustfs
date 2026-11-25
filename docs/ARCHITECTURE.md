@@ -31,3 +31,8 @@ Debian 13 and Ubuntu 24.04:
 | Does RustFS change the owner or mode of its drive roots at startup? | No. The drive roots stay `rustfs:rustfs 0750`, and the idempotence step is green. |
 | Does systemd change secret values on their way from `secrets.env` into the process? | No. The test secret `molecule-secret $#'key-0123456789` (a space, `$`, `#` and `'`) reaches `/proc/<pid>/environ` byte for byte, S3 SigV4 requests authenticate with it, and the restart decision sees no difference on the next run. Inside a double-quoted `EnvironmentFile` value systemd only interprets `"`, `\` and line breaks, which validation already refuses. |
 | Does the extra file `ca.key` in the TLS directory disturb RustFS? | No. RustFS scans only sub-directories of the TLS path for per-domain material and ignores plain files; `rustfs tls inspect` reports `single-cert/default`. |
+
+The `distributed` scenario (four nodes with two drive directories each,
+internode TLS with one generated CA) runs the same unit unchanged: every node
+starts, serves S3 through any node, and passes `systemd-analyze verify`;
+internode RPC over HTTPS needs no extra path, address family or capability.

@@ -1,0 +1,16 @@
+---
+# Converge for the distributed scenario: the first bootstrap of the four-node
+# cluster in one play (every node starts in the same run). All scenario
+# variables live in provisioner.inventory.group_vars.rustfs of molecule.yml,
+# so this play only includes the role. Rollout and behaviour plays live in
+# side_effect.yml and verify.yml, so idempotence re-runs only this plain
+# converge.
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs

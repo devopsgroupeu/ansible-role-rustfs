@@ -1,0 +1,148 @@
+---
+# Distributed scenario: a four-node erasure-coded cluster (MNMD), two drive
+# directories per node, generated TLS with one CA shared by every node.
+#
+# Networking: the four platforms share the named Docker network
+# rustfs-distributed-net, so the container names resolve through Docker's
+# embedded DNS; the volume host names, the generated certificate SANs and the
+# inventory names are therefore the same (rustfs-node1 to rustfs-node4). The
+# network is declared under each platform so molecule-plugins creates it
+# before the first container starts and removes it on destroy.
+#
+# Sequence: prepare also proves the first-bootstrap guard (preflight P7) on
+# the still-empty hosts; converge bootstraps the cluster in one play;
+# idempotence must report changed=0 on all four nodes; side_effect.yml rolls
+# a log level change node by node, then restarts all nodes together for a
+# new RPC secret; verify.yml checks the cluster, the derived defaults, and
+# that serial, inconsistent cluster variables and a dead peer are refused.
+#
+# Resources: each RustFS process peaked at about 130 MB resident memory
+# during the restarts (Debian 12, arm64), so the four containers need well
+# under 1 GiB of Docker memory.
+# Run with:
+#   molecule test -s distributed
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: rustfs-node1
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+    networks:
+      - name: rustfs-distributed-net
+
+  - name: rustfs-node2
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+    networks:
+      - name: rustfs-distributed-net
+
+  - name: rustfs-node3
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+    networks:
+      - name: rustfs-distributed-net
+
+  - name: rustfs-node4
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+    networks:
+      - name: rustfs-distributed-net
+
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      callbacks_enabled: profile_tasks, timer
+      stdout_callback: default
+    ssh_connection:
+      pipelining: false
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+    group_vars:
+      rustfs:
+        # MNMD: four nodes with two drives each, one erasure set of eight
+        # drives. The host names are the container (and inventory) names, so
+        # rustfs_node_address and rustfs_cluster_hosts keep their defaults.
+        rustfs_volumes:
+          - "https://rustfs-node{1...4}:9000/data/rustfs{0...1}"
+        # No BYO material in the containers: generate one CA on rustfs-node1
+        # and a node certificate per node.
+        rustfs_tls_generate_certs: true
+        # Container: data dirs are plain directories, not mount points.
+        rustfs_require_mounted_drives: false
+        # Container: all drives share one device.
+        rustfs_unsafe_bypass_disk_check: true
+        # Container: the data dirs sit on the overlayfs root filesystem.
+        rustfs_unsupported_fs_policy: "warn"
+        # Test root access key (the default "" is refused).
+        rustfs_access_key: "MOLECULEADMIN"
+        # Test root secret key.
+        rustfs_secret_key: "molecule-secret-key-0123456789"
+        # Test internode RPC secret (required in distributed mode).
+        rustfs_rpc_secret: "molecule-rpc-secret-0123456789"
+        # Test IAM master key (required in distributed mode).
+        rustfs_iam_master_key: "molecule-iam-master-key-0123456789"
+        # Scenario variable, not a role variable: the RPC secret of the
+        # together-restart phase of side_effect.yml. Every later play that
+        # runs the role passes it as rustfs_rpc_secret.
+        __molecule_rotated_rpc_secret: "molecule-rpc-secret-rotated-0123456789"
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - side_effect
+    - verify
+    - cleanup
+    - destroy

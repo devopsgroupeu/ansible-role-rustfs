@@ -1,0 +1,461 @@
+---
+# Verify the distributed scenario (four nodes, generated TLS, after the two
+# restart phases of side_effect.yml).
+# Play 1 checks the cluster: every node ready on the default version with
+# no unavailable or missing drive, write quorum, the phase 1 log level and
+# the rotated RPC secret in the env files and the processes, one CA shared
+# by every node, and objects readable through every node. Play 2 checks the
+# derived defaults (rustfs_cluster_hosts, rustfs_node_address). The
+# behaviour plays then re-run the role: serial and inconsistent cluster
+# variables are refused before anything changes, a dead peer stops the
+# rolling restart before the first node goes down (Review Focus 4), and a
+# run on the whole cluster starts the dead node and rolls the others.
+# Every play that runs the role passes the phase 2 RPC secret
+# (__molecule_rotated_rpc_secret) and the log level it expects.
+
+- name: Verify cluster
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_role_dir: "{{ playbook_dir }}/../.."
+    __verify_url: "https://{{ inventory_hostname }}:9000"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+    # argv of every signed S3 request (curl SigV4). The explicit
+    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
+    __verify_s3_curl:
+      - curl
+      - --silent
+      - --show-error
+      - --fail
+      - --cacert
+      - "{{ __verify_ca }}"
+      - --aws-sigv4
+      - "aws:amz:us-east-1:s3"
+      - --user
+      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
+      - -H
+      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+  tasks:
+    # Read from the role's defaults, so a version bump needs no change here.
+    - name: Read the default version of the role
+      ansible.builtin.set_fact:
+        __verify_default_version: "{{ (lookup('ansible.builtin.file', __verify_role_dir ~ '/defaults/main.yml') | from_yaml)['rustfs_version'] }}"
+
+    - name: Probe /health/ready
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_ready
+
+    - name: Probe /minio/health/cluster
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/minio/health/cluster"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_cluster
+
+    - name: Assert the node is ready with every drive online
+      ansible.builtin.assert:
+        that:
+          - __verify_ready['status'] == 200 and __verify_ready['json']['ready'] is true
+          - __verify_ready['json']['version'] == __verify_default_version
+          - __verify_ready['json']['details']['storage']['unavailableDrives'] == []
+          - __verify_ready['json']['details']['storage']['missingDrives'] == []
+          - __verify_cluster['status'] == 200
+        fail_msg: >-
+          {{ inventory_hostname }}: ready {{ __verify_ready['json'] | default(__verify_ready['status']) }},
+          cluster health {{ __verify_cluster['status'] }}, expected version {{ __verify_default_version }}
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Read the running process
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    # The binary exists here, so systemd-analyze must pass without any
+    # warning: the unit of spec 7.4 is used unchanged on every node.
+    - name: Assert the env file and the unit
+      ansible.builtin.assert:
+        that:
+          - __verify_analyze['rc'] == 0
+          - "'RUSTFS_VOLUMES=\"https://rustfs-node{1...4}:9000/data/rustfs{0...1}\"' in __verify_env"
+          - "'RUSTFS_OBS_LOGGER_LEVEL=\"warn\"' in __verify_env"
+          - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1' in __verify_unit"
+          - __verify_proc_exe == '/usr/local/bin/rustfs-' ~ __verify_default_version ~ '-musl'
+        fail_msg: >-
+          {{ inventory_hostname }}: env file, unit or process binary is wrong
+          (exe {{ __verify_proc_exe }}, systemd-analyze {{ __verify_analyze['stderr'] }})
+
+    # The rotated RPC secret of phase 2 and the IAM master key (decisions
+    # file) are in secrets.env and in the process, never in the env file.
+    - name: Assert the secrets of the cluster
+      ansible.builtin.assert:
+        that:
+          - ('RUSTFS_RPC_SECRET="' ~ __molecule_rotated_rpc_secret ~ '"') in __verify_secrets.splitlines()
+          - "'RUSTFS_IAM_MASTER_KEY=\"molecule-iam-master-key-0123456789\"' in __verify_secrets.splitlines()"
+          - __verify_proc_env['RUSTFS_RPC_SECRET'] == __molecule_rotated_rpc_secret
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY'] == 'molecule-iam-master-key-0123456789'
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'warn'
+          - __molecule_rotated_rpc_secret not in __verify_env
+          - rustfs_rpc_secret not in __verify_env
+          - "'molecule-iam-master-key-0123456789' not in __verify_env"
+          - rustfs_secret_key not in __verify_env
+      no_log: true
+
+    - name: Verify the node certificate against the CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - verify
+          - -CAfile
+          - "{{ __verify_ca }}"
+          - /etc/rustfs/tls/rustfs_cert.pem
+      register: __verify_openssl
+      changed_when: false
+      failed_when: false
+
+    - name: Stat the CA certificate with its checksum
+      ansible.builtin.stat:
+        path: "{{ __verify_ca }}"
+        checksum_algorithm: sha256
+      register: __verify_ca_stat
+
+    # One CA for the whole cluster: every node's ca.crt is the same file.
+    - name: Assert every node certificate verifies against the shared CA
+      ansible.builtin.assert:
+        that:
+          - __verify_openssl['rc'] == 0
+          - >-
+            ansible_play_hosts | map('extract', hostvars, ['__verify_ca_stat', 'stat', 'checksum'])
+            | unique | list | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }}: openssl verify rc {{ __verify_openssl['rc'] }}
+          ({{ __verify_openssl['stdout'] }} {{ __verify_openssl['stderr'] }}), CA checksums
+          {{ ansible_play_hosts | map('extract', hostvars, ['__verify_ca_stat', 'stat', 'checksum']) | list }}
+
+    # The object side_effect.yml wrote through rustfs-node1 before both
+    # restart phases.
+    - name: Download the side effect object through this node
+      ansible.builtin.command:
+        argv: "{{ __verify_s3_curl + [__verify_url ~ '/molecule-bucket/object.txt'] }}"
+      register: __verify_get_side_effect
+      changed_when: false
+      no_log: true
+
+    - name: Write the verify object payload on rustfs-node1
+      ansible.builtin.copy:
+        content: "molecule-verify-payload"
+        dest: /root/molecule-verify.txt
+        owner: root
+        group: root
+        mode: "0600"
+      when: inventory_hostname == 'rustfs-node1'
+
+    - name: Upload the verify object through rustfs-node1
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--upload-file', '/root/molecule-verify.txt',
+                                 __verify_url ~ '/molecule-bucket/verify.txt'] }}
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == 'rustfs-node1'
+
+    - name: Download the verify object through rustfs-node4
+      ansible.builtin.command:
+        argv: "{{ __verify_s3_curl + [__verify_url ~ '/molecule-bucket/verify.txt'] }}"
+      register: __verify_get_verify
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Assert the objects are readable through every node
+      ansible.builtin.assert:
+        that:
+          - __verify_get_side_effect['stdout'] == 'molecule-distributed-payload'
+          - inventory_hostname != 'rustfs-node4' or __verify_get_verify['stdout'] == 'molecule-verify-payload'
+        fail_msg: >-
+          {{ inventory_hostname }}: side effect object
+          '{{ __verify_get_side_effect['stdout'] }}', verify object
+          '{{ __verify_get_verify['stdout'] | default('not read here') }}'
+
+# Role included in render mode with public: true, so its defaults can be
+# asserted. The same variables as the running cluster, so nothing changes.
+- name: Verify derived cluster defaults
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role in render mode with its defaults public
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+        public: true
+      vars:
+        rustfs_config_only: true
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Assert the distributed defaults
+      ansible.builtin.assert:
+        that:
+          - __rustfs_distributed
+          - rustfs_cluster_hosts == groups['rustfs']
+          - rustfs_node_address == inventory_hostname
+          - __rustfs_volume_hosts == groups['rustfs']
+          - rustfs_data_dirs == ['/data/rustfs0', '/data/rustfs1']
+          - __rustfs_peer_urls | map(attribute='name') | list == groups['rustfs'] | reject('equalto', inventory_hostname) | list
+          - __rustfs_node_url == 'https://' ~ inventory_hostname ~ ':9000'
+        fail_msg: >-
+          cluster hosts {{ rustfs_cluster_hosts }}, node address {{ rustfs_node_address }},
+          volume hosts {{ __rustfs_volume_hosts }}, data dirs {{ rustfs_data_dirs }},
+          peers {{ __rustfs_peer_urls }}
+
+    # Task-level override: role defaults are templated lazily.
+    - name: Assert a standalone layout is its own cluster
+      vars:
+        rustfs_volumes: ["/data/x{0...3}"]
+      ansible.builtin.assert:
+        that:
+          - not __rustfs_distributed
+          - rustfs_cluster_hosts == [inventory_hostname]
+        fail_msg: "standalone cluster hosts {{ rustfs_cluster_hosts }}"
+
+# ------------------------------------------------------------------------------
+# Behaviour plays. The refused runs record the host state (main PID, symlink
+# target, env file checksum) before and after, and check the refusal with
+# molecule/shared/tasks/expect_failure.yml (the message names the problem
+# and never the secret).
+# ------------------------------------------------------------------------------
+
+# Rule 21: serial breaks the first bootstrap and the consistency check.
+- name: "Behaviour: serial is refused"
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 2
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a play with serial"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "runs in batches of 2 of 4 hosts (serial)"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# Rule 22: one host with a diverged cluster variable is refused on every host.
+- name: "Behaviour: inconsistent cluster variables are refused"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Give rustfs-node4 a different rustfs_extra_env
+      ansible.builtin.set_fact:
+        rustfs_extra_env:
+          RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE: "bounded"
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted diverged cluster variables"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "['rustfs-node4'] differ from rustfs-node1"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    # A set_fact outlives the play.
+    - name: Reset rustfs_extra_env on rustfs-node4
+      ansible.builtin.set_fact:
+        rustfs_extra_env: {}
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# Review Focus 4 (spec 10.1 behaviour play 3): a dead node is unreachable for
+# Ansible too, so it is not in the play. The log level change renders on
+# rustfs-node1 to rustfs-node3, but the rolling restart refuses before the
+# first node goes down: rustfs-node1 (the run_once host) fails the peer
+# check, rustfs-node2 and rustfs-node3 are aborted by any_errors_fatal (they
+# enter the rescue without a failed task of their own).
+- name: "Behaviour: dead peer refuses the rollout"
+  hosts: rustfs-node1,rustfs-node2,rustfs-node3
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop RustFS on rustfs-node4
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: stopped
+      delegate_to: rustfs-node4
+      run_once: true
+
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    # ansible_failed_result outlives the play: on every host it still holds
+    # the refusal of the inconsistent cluster play. A host aborted by
+    # any_errors_fatal enters the rescue without a new one.
+    - name: Keep the last failure message of each host
+      ansible.builtin.set_fact:
+        __verify_failed_msg_before: "{{ ansible_failed_result['msg'] | default('') }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "error"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role restarted nodes while rustfs-node4 was down"
+      rescue:
+        - name: Check the refusal on the run_once host
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "refusing to restart rustfs-node1: peer rustfs-node4 is not ready"
+            __verify_secret: "{{ rustfs_secret_key }}"
+          when: inventory_hostname == 'rustfs-node1'
+
+        - name: Assert the other hosts were aborted by any_errors_fatal
+          ansible.builtin.assert:
+            that:
+              - (ansible_failed_result['msg'] | default('')) == __verify_failed_msg_before
+            fail_msg: "{{ inventory_hostname }} failed a task of its own: {{ ansible_failed_result['msg'] | default('') }}"
+          when: inventory_hostname != 'rustfs-node1'
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    # The env file was rendered with the new level before the rollout was
+    # refused; the next full run restarts with it (stateless decision).
+    - name: Assert no node was restarted
+      ansible.builtin.assert:
+        that:
+          - __verify_state['main_pid'] == __verify_state_before['main_pid']
+          - __verify_state['main_pid'] | int > 0
+          - __verify_state['link_target'] == __verify_state_before['link_target']
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    # ansible-core keeps the hosts that any_errors_fatal aborted in its list
+    # of failed hosts even after their rescue succeeded, so the next play
+    # would skip rustfs-node2 and rustfs-node3 and the playbook would exit 2.
+    - name: Clear the failed state the rescued rollout left behind
+      ansible.builtin.meta: clear_host_errors
+
+# 8.1 step 8 starts rustfs-node4 (inactive), step 11 rolls the other three.
+- name: "Behaviour: the whole cluster rolls to the new level"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_url: "https://{{ inventory_hostname }}:9000"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+  tasks:
+    - name: Run the role on every node with the new level
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "error"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Read the running process after the run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Read the env file after the run
+      ansible.builtin.slurp:
+        src: /etc/default/rustfs
+      register: __verify_env_after
+
+    - name: Probe /health/ready after the run
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_ready_after
+
+    - name: Probe /minio/health/cluster after the run
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/minio/health/cluster"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_cluster_after
+
+    - name: Assert the node serves with the new level
+      ansible.builtin.assert:
+        that:
+          - __verify_ready_after['status'] == 200 and __verify_ready_after['json']['ready'] is true
+          - __verify_ready_after['json']['details']['storage']['unavailableDrives'] == []
+          - __verify_ready_after['json']['details']['storage']['missingDrives'] == []
+          - __verify_cluster_after['status'] == 200
+          - "'RUSTFS_OBS_LOGGER_LEVEL=\"error\"' in (__verify_env_after['content'] | b64decode)"
+          - >-
+            (inventory_hostname == 'rustfs-node4' and __rustfs_state == 'inactive' and not __rustfs_restart_needed)
+            or (inventory_hostname != 'rustfs-node4' and __rustfs_restart_needed and not __rustfs_restart_together
+                and __rustfs_restart_reasons == ['RUSTFS_OBS_LOGGER_LEVEL'])
+        fail_msg: >-
+          {{ inventory_hostname }}: ready {{ __verify_ready_after['json'] | default(__verify_ready_after['status']) }},
+          cluster health {{ __verify_cluster_after['status'] }}, probed state {{ __rustfs_state | default('unset') }},
+          restart needed {{ __rustfs_restart_needed | default('unset') }},
+          together {{ __rustfs_restart_together | default('unset') }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+    - name: Assert the process runs the new level
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'error'
+      no_log: true

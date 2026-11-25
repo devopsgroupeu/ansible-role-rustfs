@@ -1,0 +1,202 @@
+---
+# Side effect of the distributed scenario (spec 10.1 distributed, steps 1 to 3).
+#   1. write an object through rustfs-node1; record every node's main PID,
+#      unit timestamps and the wall clock;
+#   2. phase 1, rolling: re-run the role with rustfs_log_level "warn". Every
+#      node restarts exactly once, one after another in play order: node N+1
+#      goes down and starts only after node N became active (READY=1);
+#   3. phase 2, together: re-run the role with a new rustfs_rpc_secret (nodes
+#      with the old and the new secret cannot talk to each other). Every node
+#      restarts exactly once more, and every restart began before any node
+#      became active.
+# "Exactly once" counts systemd's unit-started journal entries since the
+# phase began (tasks/read_unit_times.yml), so an automatic restart after a
+# crash would count too. The assertions live here because facts do not
+# survive into the separate verify playbook.
+
+- name: "Side effect: rolling and together restarts"
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_url: "https://{{ inventory_hostname }}:9000"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+    # argv of every signed S3 request (curl SigV4). The explicit
+    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
+    __verify_s3_curl:
+      - curl
+      - --silent
+      - --show-error
+      - --cacert
+      - "{{ __verify_ca }}"
+      - --aws-sigv4
+      - "aws:amz:us-east-1:s3"
+      - --user
+      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
+      - -H
+      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+  tasks:
+    # --------------------------------------------------------------------------
+    # Step 1: write the test object through rustfs-node1, record the baseline
+    # --------------------------------------------------------------------------
+
+    - name: Write the test object payload on rustfs-node1
+      ansible.builtin.copy:
+        content: "molecule-distributed-payload"
+        dest: /root/molecule-distributed.txt
+        owner: root
+        group: root
+        mode: "0600"
+      when: inventory_hostname == 'rustfs-node1'
+
+    # 409 when an earlier side_effect run created it already.
+    - name: Create the test bucket through rustfs-node1
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--output', '/dev/null', '--write-out', '%{http_code}',
+                                 '-X', 'PUT', __verify_url ~ '/molecule-bucket'] }}
+      register: __verify_bucket
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == 'rustfs-node1'
+
+    - name: Assert the test bucket exists
+      ansible.builtin.assert:
+        that:
+          - __verify_bucket['rc'] == 0
+          - __verify_bucket['stdout'] in ['200', '409']
+        fail_msg: "bucket creation returned rc {{ __verify_bucket['rc'] }}, HTTP {{ __verify_bucket['stdout'] }}"
+      when: inventory_hostname == 'rustfs-node1'
+
+    - name: Upload the test object through rustfs-node1
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--fail', '--upload-file', '/root/molecule-distributed.txt',
+                                 __verify_url ~ '/molecule-bucket/object.txt'] }}
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == 'rustfs-node1'
+
+    - name: Read the unit before phase 1
+      ansible.builtin.include_tasks: tasks/read_unit_times.yml
+      vars:
+        __verify_since: ""
+
+    - name: Keep the unit state before phase 1
+      ansible.builtin.set_fact:
+        __verify_unit_0: "{{ __verify_unit }}"
+
+    - name: Assert every node runs before phase 1
+      ansible.builtin.assert:
+        that:
+          - __verify_unit_0['pid'] > 0
+        fail_msg: "{{ inventory_hostname }} has no main process before phase 1"
+
+    # --------------------------------------------------------------------------
+    # Step 2: phase 1, rolling restart for a new log level
+    # --------------------------------------------------------------------------
+
+    - name: "Phase 1: run the role with a new log level"
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+
+    - name: Read the unit after phase 1
+      ansible.builtin.include_tasks: tasks/read_unit_times.yml
+      vars:
+        __verify_since: "{{ __verify_unit_0['now'] }}"
+
+    - name: Keep the unit state after phase 1
+      ansible.builtin.set_fact:
+        __verify_unit_1: "{{ __verify_unit }}"
+
+    - name: Assert phase 1 restarted every node exactly once in the rolling path
+      ansible.builtin.assert:
+        that:
+          - __verify_unit_1['pid'] > 0
+          - __verify_unit_1['pid'] != __verify_unit_0['pid']
+          - __verify_unit_1['starts'] == 1
+          - __rustfs_restart_needed
+          - not __rustfs_restart_together
+          - __rustfs_restart_reasons == ['RUSTFS_OBS_LOGGER_LEVEL']
+        fail_msg: >-
+          {{ inventory_hostname }}: main PID {{ __verify_unit_0['pid'] }} -> {{ __verify_unit_1['pid'] }},
+          {{ __verify_unit_1['starts'] }} starts, together {{ __rustfs_restart_together | default('unset') }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+    # Node N+1 went down (stop) and came up (start) only after node N was
+    # active again, so at most one node was down at any time.
+    - name: Assert phase 1 restarted each node after the previous one was active
+      vars:
+        __verify_units: "{{ ansible_play_hosts | map('extract', hostvars, '__verify_unit_1') | list }}"
+        __verify_early: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for i in range(__verify_units | length - 1)
+                if __verify_units[i + 1]['stop'] <= __verify_units[i]['active']
+                   or __verify_units[i + 1]['start'] <= __verify_units[i]['active'] -%}
+          {%-   set ns.out = ns.out + [ansible_play_hosts[i + 1]] -%}
+          {%- endfor -%}
+          {{ ns.out }}
+      ansible.builtin.assert:
+        that:
+          - __verify_units | length == 4
+          - __verify_early | length == 0
+        fail_msg: >-
+          {{ __verify_early }} restarted before the previous node was active. Play order
+          {{ ansible_play_hosts }}, stops {{ __verify_units | map(attribute='stop') | list }},
+          starts {{ __verify_units | map(attribute='start') | list }},
+          active {{ __verify_units | map(attribute='active') | list }}
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # Step 3: phase 2, together restart for a new RPC secret
+    # --------------------------------------------------------------------------
+
+    - name: "Phase 2: run the role with a new RPC secret"
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Read the unit after phase 2
+      ansible.builtin.include_tasks: tasks/read_unit_times.yml
+      vars:
+        __verify_since: "{{ __verify_unit_1['now'] }}"
+
+    - name: Keep the unit state after phase 2
+      ansible.builtin.set_fact:
+        __verify_unit_2: "{{ __verify_unit }}"
+
+    - name: Assert phase 2 restarted every node exactly once in the together path
+      ansible.builtin.assert:
+        that:
+          - __verify_unit_2['pid'] > 0
+          - __verify_unit_2['pid'] != __verify_unit_1['pid']
+          - __verify_unit_2['starts'] == 1
+          - __rustfs_restart_needed
+          - __rustfs_restart_together
+          - __rustfs_restart_reasons == ['RUSTFS_RPC_SECRET']
+        fail_msg: >-
+          {{ inventory_hostname }}: main PID {{ __verify_unit_1['pid'] }} -> {{ __verify_unit_2['pid'] }},
+          {{ __verify_unit_2['starts'] }} starts, together {{ __rustfs_restart_together | default('unset') }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+    # The restart began (stop) on every node before any node was active
+    # again. The main process start itself is not compared: how long the old
+    # process takes to stop differs per node (up to a second observed), so a
+    # quick node can be active before a slow one has started.
+    - name: Assert phase 2 restarted every node before any was active
+      vars:
+        __verify_units: "{{ ansible_play_hosts | map('extract', hostvars, '__verify_unit_2') | list }}"
+      ansible.builtin.assert:
+        that:
+          - __verify_units | length == 4
+          - (__verify_units | map(attribute='stop') | max) < (__verify_units | map(attribute='active') | min)
+        fail_msg: >-
+          a node became active before the last one went down. Play order
+          {{ ansible_play_hosts }}, stops {{ __verify_units | map(attribute='stop') | list }},
+          starts {{ __verify_units | map(attribute='start') | list }},
+          active {{ __verify_units | map(attribute='active') | list }}
+      run_once: true
