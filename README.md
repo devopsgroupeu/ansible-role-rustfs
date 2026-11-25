@@ -428,7 +428,7 @@ The CI pipeline (`ci.yml`) runs on pushes and pull requests to `main` and
 `develop`. The `lint` job runs `yamllint`,
 `ansible-lint --profile production` on the role and on the Molecule and
 example playbooks, and the variable count and ASCII checks of
-[CONTRIBUTING.md](CONTRIBUTING.md). The `molecule` job runs `render` and
+[CONTRIBUTING.md](.github/CONTRIBUTING.md). The `molecule` job runs `render` and
 `default` on `debian12`, `debian13` and `ubuntu2404`, `default` also on
 `rockylinux9`, and `upgrade` on `debian12`. On `default`/`debian12` it keeps
 the container, fails when a test secret appears in the Molecule log, and runs
@@ -489,11 +489,11 @@ ansible-role-rustfs/
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+We welcome contributions! Please see [CONTRIBUTING.md](.github/CONTRIBUTING.md) to get started.
 
 ## Code of Conduct
 
-Read our [Code of Conduct](CODE_OF_CONDUCT.md).
+Read our [Code of Conduct](.github/CODE_OF_CONDUCT.md).
 
 ## Changelog
 
