@@ -110,8 +110,10 @@ sequenceDiagram
     Ctrl->>N1: flush handlers: systemctl daemon-reload (unit changed)
 
     Note over Ctrl,Nx: 3. Service
+    Ctrl->>N1: check the node certificate against ca.crt and the OS store, pick the probe CA
     Ctrl->>N1: compare the process with the files, the binary and the served certificate, decide
     Ctrl->>N1: rustfs tls inspect (before any start or restart)
+    Ctrl->>N1: a cluster-wide change: refuse when a cluster host dropped out after preflight
     Ctrl->>N1: point the rustfs symlink at the versioned binary
     Ctrl->>N1: systemctl start --no-block
     Ctrl->>Nx: systemctl start --no-block (all inactive hosts in parallel)
@@ -136,7 +138,18 @@ sequenceDiagram
   passes on old values, and the role needs the default linear strategy. The
   TLS checks of BYO material that need `python3-cryptography` run in the TLS
   stage; a host that fails there has new files on disk but is not
-  restarted.
+  restarted. A host can also fail after preflight (a download, a package, a
+  TLS check): before any start or restart, every host whose run changes a
+  cluster-wide key (layout, RPC secret, root credentials, IAM keys) checks
+  that every cluster host reached the service stage, and refuses otherwise,
+  so the others never restart onto values the failed host does not have.
+- **Probe trust follows the certificate.** RustFS trusts `ca.crt` and, with
+  `rustfs_tls_trust_system_ca`, the OS store too; a `uri` probe with
+  `ca_path` trusts that file only. The service stage checks the node
+  certificate against each store RustFS uses
+  (`community.crypto.certificate_complete_chain`), refuses one that neither
+  signs, and lets the probes use `ca.crt` when it signs the certificate,
+  else the OS store.
 - **Install once per version.** When the versioned binary
   `rustfs-<version>-<libc>` exists and matches the digest file the role
   wrote when it installed it, nothing is downloaded and no temporary
@@ -235,6 +248,10 @@ sequenceDiagram
         alt a drive stays offline
             Ctrl-->>Ctrl: fail: refusing to restart N (nothing restarted)
         end
+        Ctrl->>P: stat DRIVE/.rustfs.sys/healing.bin on every other cluster host until gone
+        alt a drive stays healing, or a host cannot be checked
+            Ctrl-->>Ctrl: fail: refusing to restart N (nothing restarted)
+        end
         Ctrl->>N: point the rustfs symlink at the versioned binary
         Ctrl->>N: systemctl restart --no-block
         Ctrl->>N: wait for a new MainPID, then /health/ready 200 and ready
@@ -263,8 +280,22 @@ sequenceDiagram
   `rustfs_ready_retries` x `rustfs_ready_delay` for that, because a peer can
   still list the drives of a node that started moments ago, and then
   refuses. A cluster with a dead drive is rolled after the drive is replaced
-  ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#a-drive-is-offline)), or with
-  `rustfs_rolling_restart: false` in a maintenance window.
+  and healed ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#a-drive-is-offline)),
+  or with `rustfs_rolling_restart: false` in a maintenance window.
+- **No drive healing elsewhere.** A replaced (or returning) drive leaves the
+  drive lists once RustFS has formatted it, but the erasure-set heal that
+  rebuilds its shards can run for hours, and readiness does not report it.
+  Until it ends, objects not rebuilt yet have one shard fewer, so the same
+  quorum argument applies. RustFS keeps `<drive>/.rustfs.sys/healing.bin` on
+  a drive while it heals it (`HEALING_MARKER_PATH`). Before each restart the
+  role stats that marker at every drive root of `rustfs_volumes` on every
+  other cluster host, delegated, so hosts outside `--limit` are checked too;
+  it waits like the drive gate and refuses on a marker that stays or a host
+  it cannot check. The node being restarted is not checked, for the same
+  reason as above. RustFS writes the marker right after it has formatted the
+  drive, before it rebuilds anything; in a test with 78 MB on the drive the
+  marker appeared in the same 0.2 s poll in which the drive left the lists,
+  and stayed for the 3 s of the rebuild.
 - **Re-admission, not just readiness.** A node's own `/health/ready` says it
   can reach the cluster, not that the cluster reaches it again. The next
   node goes down only after every peer lists every drive online again (drive
@@ -273,7 +304,8 @@ sequenceDiagram
   play in play order, standalone nodes included, one at a time: a failure
   stops the rollout of every node after it, also of unrelated standalone
   nodes in the same play. Each node is probed and waited for with its own
-  settings (probe CA, retries, delay), which `service.yml` stores as facts.
+  settings (probe CA, retries, delay, heal markers), which `service.yml`
+  stores as facts.
 - **`any_errors_fatal`.** A failure inside the `run_once` loop would
   otherwise fail only the `run_once` host while the other hosts carry on.
   The loop sits in a block with `any_errors_fatal: true`, so a failed
@@ -314,6 +346,7 @@ Debian 13 and Ubuntu 24.04:
 | Does RustFS serve data from directories on the container's overlay root filesystem? | Yes, with `rustfs_unsupported_fs_policy: "warn"` (the `upgrade` scenario uses plain directories; the others need it while a tmpfs drive is unmounted, because the directory below sits on overlayfs): it logs `Unsupported filesystem type detected ... (overlayfs)` at WARN and continues. tmpfs is a supported filesystem. Production keeps the default `fail`; there the directory below an unmounted drive is on the root filesystem (XFS or ext4), which passes the check. |
 | Does RustFS change the owner or mode of its drive roots at startup? | No. The drive roots stay `rustfs:rustfs 0750`, and the idempotence step is green. |
 | What happens when a drive is not mounted? | The unit (ordered after the mounts, not bound to them) starts; RustFS reports the drive in `missingDrives`, serves on the other three and writes nothing to the empty `root:root 0755` directory below the mount point. A new tmpfs mounted later is not visible to the running process; after a restart and a role run (which sets the owner) RustFS formats and heals it without another restart. |
+| And with two drives not mounted? | The node does not start: both directories sit on the root filesystem, and the distinct-disk check (on, as in production; each tmpfs has its own device number) exits with `local erasure endpoints must use distinct physical disks`, every 10 s. Two new tmpfs drives are taken in like one (four drives, parity 2). |
 | Does boot wait for the unit? | No. With `DefaultDependencies=no` (the service defaults restored explicitly) `multi-user.target` is not ordered after `rustfs.service`. |
 | Does systemd change secret values on their way from `secrets.env` into the process? | No. The test secret `molecule-secret $#'key-0123456789` (a space, `$`, `#` and `'`) reaches `/proc/<pid>/environ` byte for byte, S3 SigV4 requests authenticate with it, and the restart decision sees no difference on the next run. Inside a double-quoted `EnvironmentFile` value systemd only interprets `"`, `\` and line breaks, which validation already refuses. |
 | Does the extra file `ca.key` in the TLS directory disturb RustFS? | No. RustFS scans only sub-directories of the TLS path for per-domain material and ignores plain files; `rustfs tls inspect` reports `single-cert/default`. |

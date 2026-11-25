@@ -200,11 +200,13 @@ unreadable: store it with the other secrets and back it up.
 TLS is **on by default** and covers S3, console and internode traffic with
 one certificate per node. RustFS trusts `ca.crt` (and `public.crt`) in the
 TLS directory; `rustfs_tls_trust_system_ca: true` adds the OS store on top.
-With a private CA, `ca.crt` is the trust anchor and is required, and the
-role's health probes use it whenever it exists. The key is
+With a private CA, `ca.crt` is the trust anchor and is required. The role's
+health probes trust one store: `ca.crt` when it signs the node certificate,
+else the OS store (with `rustfs_tls_trust_system_ca`). The key is
 `root:rustfs 0640`. The role checks BYO material before it can break a
 node: validity, serverAuth in an extended key usage, a SAN for
-`rustfs_node_address`, and that the key belongs to the certificate. Server
+`rustfs_node_address`, that the key belongs to the certificate, and that
+`ca.crt` or the trusted OS store signs it. Server
 mTLS (`RUSTFS_SERVER_MTLS_ENABLE`) is not supported: the role's health
 probes have no client certificate.
 
@@ -264,9 +266,10 @@ messages and the "RustFS restarts" message contain key names only.
 
 There is no restart handler. Every run compares each node's running binary,
 environment and served certificate with the desired state and restarts only
-what differs: **one node at a time** for ordinary changes (every peer ready
-and every drive online before a node goes down, every drive online again
-after it), **all changed nodes together** for an RPC secret or a volume
+what differs: **one node at a time** for ordinary changes (every peer ready,
+every drive online and no drive of another node healing before a node goes
+down, every drive online again after it), **all changed nodes together**
+for an RPC secret or a volume
 change, or when `rustfs_rolling_restart: false`. A run that died half way,
 or a `--tags config` run, is completed by the next run with exactly one
 restart. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#restart-decision-and-rolling-restart).
@@ -278,11 +281,13 @@ restart. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#restart-decision-a
 - `--limit <node>` is fine for day-2 work on a healthy cluster, but cannot
   bootstrap a cluster, and cannot change `rustfs_volumes`, the RPC secret,
   the root credentials or the IAM master key (all refused: they must change
-  on every node in the same run). Add or replace nodes with a full-cluster
-  run.
-- With a drive offline, a rolling restart is refused: replace the drive
-  first ([TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-drive-is-offline)),
-  or use `rustfs_rolling_restart: false` in a maintenance window.
+  on every node in the same run, and a node that fails later in the run
+  stops the others from restarting onto them too). Add or replace nodes
+  with a full-cluster run.
+- With a drive offline, or a replaced drive that RustFS is still healing, a
+  rolling restart is refused: replace the drive and wait for its heal first
+  ([TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-drive-is-offline)), or use
+  `rustfs_rolling_restart: false` in a maintenance window.
 - Stage tags `install`, `config`, `tls` and `service` select stages when the
   role is applied statically (`roles:` or `import_role`); the guards are
   tagged `always` and run with any selection. A start or restart loads the
@@ -365,17 +370,23 @@ Mount every drive through `/etc/fstab` by UUID with `nofail`, on a mount
 point that stays `root:root` while unmounted. With
 `rustfs_require_mounted_drives: true` (the default) the role runs only when
 every data dir is mounted, and the unit is ordered after the mounts without
-depending on them. After a reboot with a failed mount, or when a disk drops
+depending on them. After a reboot with one failed mount, or when a disk drops
 out at runtime, the node keeps serving on its other drives (one offline
 drive, not a node down), and RustFS cannot write to the root-owned directory
-below the mount point. Boot does not wait for RustFS either.
+below the mount point. Two or more failed mounts on one node are different:
+their mount point directories share the root disk, RustFS refuses to start
+(`local erasure endpoints must use distinct physical disks`), and the node
+is down until the mounts are back. Boot does not wait for RustFS either.
 
 To replace a failed disk: mount an empty, identically formatted one at the
 same path, restart RustFS on that node (so it sees the new mount), run the
 play for that node (it sets the owner of the new filesystem; `--limit` is
-fine), and wait until no node lists the drive in `/health/ready` any more
-(RustFS formats and heals it). Until then rolling restarts are refused. Step
-by step: [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-drive-is-offline).
+fine), wait until no node lists the drive in `/health/ready` any more
+(RustFS has formatted it), then wait until its heal has ended (RustFS
+rebuilds the drive for hours on a full disk and keeps
+`.rustfs.sys/healing.bin` on it meanwhile). Until then rolling restarts
+wait and are refused. Step by step:
+[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-drive-is-offline).
 
 ### Service user and group
 
@@ -396,15 +407,17 @@ ansible-galaxy collection install -r requirements.yml
 molecule test -s render
 
 # Single node, four tmpfs drives, generated TLS: install, start, S3 round trip,
-# behaviour plays (stage tags, an unmounted and a replaced drive, certificate
-# reloads, IAM master key change, symlinked binary directory, proxies)
+# behaviour plays (stage tags, one and two unmounted drives, replaced drives,
+# certificate reloads, probe trust, IAM master key change, symlinked binary
+# directory, proxies)
 molecule test -s default
 
 # Upgrade, downgrade refusal and rollback between two releases
 molecule test -s upgrade
 
 # Four-node cluster with tmpfs drives: parallel bootstrap, rolling and together
-# restarts, dead peer, offline drive, free strategy, two-run IAM key rotation
+# restarts, dead peer, offline and healing drive, a host failing after
+# preflight, free strategy, two-run IAM key rotation
 molecule test -s distributed
 
 # Another distribution (debian12 is the default)

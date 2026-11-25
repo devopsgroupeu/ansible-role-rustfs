@@ -73,8 +73,11 @@ The role does not partition, format or mount drives; it refuses to continue
 until every data dir is a mount point (`rustfs_require_mounted_drives`).
 Prepare them in `pre_tasks`, one XFS filesystem per physical disk, mounted
 by UUID with `nofail` (a dead disk must not block the boot). The RustFS unit
-is ordered after these mounts but does not depend on them: a drive that
-does not mount is one offline drive, and the node serves on the others.
+is ordered after these mounts but does not depend on them: one drive that
+does not mount is one offline drive, and the node serves on the others. Two
+or more that do not mount on one node leave their mount point directories
+on the root disk together, and RustFS refuses to start until they are
+mounted again (distinct-disk check).
 This snippet uses `community.general` and `ansible.posix`, which the role
 itself does not need:
 
@@ -135,13 +138,17 @@ drive is not mounted. `ansible.posix.mount` creates a missing mount point as
 `root:root 0755`; keep it that way (never `chown` it while the drive is
 unmounted). The service user has no capabilities, so it cannot write there:
 RustFS reports the drive as missing and serves on the others, and no object
-data lands on the root disk. Do not add a `file` task for the mount points
-to the snippet: on a mounted drive it would change the filesystem root the
-role owns.
+data lands on the root disk. This holds for one drive per node; a second
+unmounted drive stops the node at startup with
+`local erasure endpoints must use distinct physical disks`
+([TROUBLESHOOTING.md](TROUBLESHOOTING.md#distinct-physical-disks)). Do not
+add a `file` task for the mount points to the snippet: on a mounted drive it
+would change the filesystem root the role owns.
 
 A filesystem mounted after RustFS started (a late mount, a replaced disk) is
 not visible to the running process: restart RustFS on that node, then run
-the play for it (it sets the owner of a new filesystem)
+the play for it (it sets the owner of a new filesystem), and let RustFS heal
+a new disk before the next rolling change
 ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#a-drive-is-offline)).
 
 ---
@@ -156,7 +163,7 @@ With the default `rustfs_tls_enabled: true` and
 |---|---|
 | `rustfs_cert.pem` | the node certificate, full chain, leaf first; SAN for `rustfs_node_address` (in a cluster: the node's host name in `rustfs_volumes`), EKU serverAuth (or no EKU extension) |
 | `rustfs_key.pem` | its private key |
-| `ca.crt` | the CA that signed every node certificate (not needed with `rustfs_tls_trust_system_ca: true`; with it, `ca.crt` is still trusted, and the role's probes use it when it exists) |
+| `ca.crt` | the CA that signed every node certificate (not needed with `rustfs_tls_trust_system_ca: true`; with it, `ca.crt` is still trusted and may hold another private CA, and the role's probes use it when it signs the node certificate, else the OS store) |
 
 Place them in `pre_tasks`, for example from files encrypted with
 `ansible-vault` next to the playbook, with the owners and modes the role

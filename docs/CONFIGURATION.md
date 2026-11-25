@@ -59,7 +59,7 @@ variable is prefixed `rustfs_`.
 | `rustfs_require_mounted_drives` | `true` | Refuse to continue unless every data dir is a mount point (the role sets the owner of mounted filesystem roots only), and order the unit after the mount unit of every data dir without depending on it. A drive that fails to mount at boot or disappears later is one offline drive: the node keeps serving on its other drives, and the root-owned directory below the mount point is not writable for RustFS ([INTEGRATION.md](INTEGRATION.md#preparing-the-drives)). Set `false` only for dev/test; the role then creates the directories on whatever filesystem holds them. |
 | `rustfs_allow_volumes_change` | `false` | Allow `RUSTFS_VOLUMES` or `RUSTFS_ERASURE_SET_DRIVE_COUNT` to differ from the deployed env file for one run. Only for appending a pool or removing a decommissioned one; the changed nodes are restarted together. |
 | `rustfs_unsupported_fs_policy` | `"fail"` | What RustFS does when a drive sits on NFS, CIFS, FUSE, overlayfs, 9p, Ceph, GlusterFS or GFS. Choices: `fail` (refuse to start), `warn` (log and continue). |
-| `rustfs_unsafe_bypass_disk_check` | `false` | Skip the upstream check that every local drive is a distinct physical disk. Test environments only (containers, loop devices); never in production. |
+| `rustfs_unsafe_bypass_disk_check` | `false` | Skip the upstream check that every local drive is a distinct physical disk. Test environments only (data dirs that are plain directories or loop devices on one disk; tmpfs drives pass the check); never in production. The check also stops a node with two or more unmounted drives, whose mount point directories share the root disk. |
 | `rustfs_cluster_hosts` | `"{{ (groups['rustfs'] \| default([inventory_hostname])) if __rustfs_distributed else [inventory_hostname] }}"` | Inventory hosts that form this node's cluster. In distributed mode the `rustfs` inventory group: used for the consistency checks, the CA host of generated certificates and the peer health checks. A standalone node is its own cluster. |
 | `rustfs_node_address` | `"{{ inventory_hostname if __rustfs_distributed else (__rustfs_listen_host if __rustfs_listen_host not in ['', '0.0.0.0', '::'] else 'localhost') }}"` | Name or IP under which the role probes this node's S3 port. In a cluster it must be the host name this node has in `rustfs_volumes`; with TLS the certificate must cover it. Default: `inventory_hostname` in a cluster, else the listen host of `rustfs_address`, or `localhost` for a wildcard listener. |
 
@@ -120,7 +120,7 @@ renewal that keeps every name restarts nothing.
 | `rustfs_tls_generate_certs` | `false` | Generate a private CA (ECC P-384, 10 years, renewed 90 days before expiry) and node certificates (SANs: `rustfs_node_address`, `inventory_hostname`, `localhost`, `127.0.0.1` and `rustfs_tls_extra_sans`; EKU serverAuth and clientAuth). Dev/test only. Requires `rustfs_tls_enabled`. |
 | `rustfs_tls_cert_validity` | `"+825d"` | Validity of generated node certificates (community.crypto relative time). A node certificate is re-signed 30 days before it expires, when its SANs or key change, or when the CA changes. |
 | `rustfs_tls_extra_sans` | `[]` | Extra SANs for generated certificates, already prefixed (`"DNS:s3.example.com"`, `"IP:10.0.0.10"`), for example a load balancer name. |
-| `rustfs_tls_trust_system_ca` | `false` | Also trust the OS CA store for outbound and peer connections (`RUSTFS_TRUST_SYSTEM_CA`), in addition to `ca.crt` (and `public.crt`) in `rustfs_tls_dir`, which stay trusted. The role's health probes use `ca.crt` whenever it exists, else the OS store, so with both `ca.crt` must hold the CA of the node certificates. When false, `ca.crt` is required. |
+| `rustfs_tls_trust_system_ca` | `false` | Also trust the OS CA store for outbound and peer connections (`RUSTFS_TRUST_SYSTEM_CA`), in addition to `ca.crt` (and `public.crt`) in `rustfs_tls_dir`, which stay trusted. The role's health probes trust one store: `ca.crt` when it signs the node certificate, else the OS store, so with both `ca.crt` may hold another private CA (for KMS, OIDC or webhook targets). Before any start or restart the role refuses a node certificate that neither store signs. When false, `ca.crt` is required. |
 
 ---
 
@@ -148,8 +148,8 @@ renewal that keeps every name restarts nothing.
 |---|---|---|
 | `rustfs_service_enabled` | `true` | Enable the unit at boot. |
 | `rustfs_service_state` | `"started"` | Desired service state. Choices: `started`, `stopped`. A node that is to be stopped is never restarted. |
-| `rustfs_rolling_restart` | `true` | Restart changed nodes one at a time, each only when every peer is ready and lists every drive online, and the next only after every peer lists every drive online again. `false` restarts all changed nodes together (a maintenance window, or a node or drive that is permanently down and blocks the rolling path). |
-| `rustfs_ready_retries` | `60` | Attempts for every wait: new main process, `/health/ready`, every drive online before and after a rolling restart, and the write-quorum gate. At least 1. |
+| `rustfs_rolling_restart` | `true` | Restart changed nodes one at a time, each only when every peer is ready and lists every drive online and no other cluster host has a drive that RustFS is still healing, and the next only after every peer lists every drive online again. `false` restarts all changed nodes together (a maintenance window, or a node, drive or heal that blocks the rolling path for too long). |
+| `rustfs_ready_retries` | `60` | Attempts for every wait: new main process, `/health/ready`, every drive online before and after a rolling restart, no drive healing before it, and the write-quorum gate. At least 1. |
 | `rustfs_ready_delay` | `5` | Seconds between attempts of every wait. At least 1. The default gives each wait 5 minutes. |
 | `rustfs_config_only` | `false` | Render-only mode: skip the host guards, install and service management. Used by the `render` Molecule scenario to validate templates offline. |
 
@@ -169,11 +169,14 @@ renewal that keeps every name restarts nothing.
   extension, when present, includes serverAuth (RustFS refuses the leaf
   otherwise), that its SANs cover `rustfs_node_address` (`DNS:<name>`, a
   one-label wildcard `DNS:*.<parent>`, or `IP:<address>`; case-insensitive,
-  no CN fallback) and that the key belongs to the certificate. Right before
-  any start or restart, `rustfs tls inspect` must find a usable server
-  certificate (it only parses the files). A host that fails a TLS check after
-  the config stage has new files on disk, but its running process is not
-  restarted.
+  no CN fallback) and that the key belongs to the certificate. The service
+  stage (every run, generated mode too) asserts that `ca.crt` or, with
+  `rustfs_tls_trust_system_ca`, the OS CA bundle signs the certificate
+  (issuer and signature, `community.crypto.certificate_complete_chain`) and
+  picks the store of the health probes from that. Right before any start or
+  restart, `rustfs tls inspect` must find a usable server certificate (it
+  only parses the files). A host that fails a TLS check after the config
+  stage has new files on disk, but its running process is not restarted.
 - **Volume syntax** (`rustfs_volumes`):
   - Ranges use three dots, `{0...3}`; `{0..3}` is shell syntax and refused.
   - Every list item is one server pool. With more than one item, or with URL

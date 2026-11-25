@@ -892,7 +892,9 @@ release, not from the mirror.
 ## TLS guards (tls_byo.yml and service.yml)
 
 The `tls_byo.yml` checks run after the config stage: a host that fails one
-has new files on disk, but its running process was not restarted.
+has new files on disk, but its running process was not restarted. The two
+`service.yml` checks run in every service stage, before any start or
+restart, in generated mode too.
 
 ### Validate the BYO TLS certificate is valid now
 
@@ -967,6 +969,40 @@ replaced.
 `openssl x509 -in rustfs_cert.pem -noout -pubkey` and
 `openssl pkey -in rustfs_key.pem -pubout`.
 
+### Validate the node certificate chains to a trusted CA
+
+**Symptom:** the play stops here with:
+
+```
+The certificate <value> of <value> chains to none of the CA stores RustFS
+trusts here (<value>): <value>. The peers and the role's health probes would
+reject it once the node restarts. Nothing was started or restarted. Put the
+CA that issued the node certificate into ca.crt, or, for a certificate of a
+public CA in the OS store, set rustfs_tls_trust_system_ca: true.
+```
+
+The third `<value>` lists the stores the role tried: `ca.crt` when it
+exists, and the OS CA bundle (`/etc/ssl/certs/ca-certificates.crt`, on EL
+`/etc/pki/tls/certs/ca-bundle.crt`) with `rustfs_tls_trust_system_ca`. The
+fourth says why each one failed, for example
+`Cannot complete chain. Stuck at certificate ...`.
+
+**Cause:** RustFS verifies its peers with `ca.crt` and, with
+`rustfs_tls_trust_system_ca`, with the OS store as well; the role's probes
+use one of the two. The node certificate (with the intermediates in
+`rustfs_cert.pem`) leads to a CA in neither: a certificate renewed from
+another CA, a `ca.crt` that holds another CA, or a certificate of a public
+CA without `rustfs_tls_trust_system_ca`. The check covers issuer
+and signature only; validity, EKU and SAN are the `tls_byo.yml` checks
+above.
+
+**Fix:** put the root CA (or the issuing CA) of the node certificate into
+`ca.crt`, or set `rustfs_tls_trust_system_ca: true` for a certificate from
+a CA in the OS store. With both, the probes use `ca.crt` when it signs the
+node certificate and the OS store otherwise, so `ca.crt` may hold another
+private CA (for KMS, OIDC or webhook targets). Check by hand with
+`openssl verify -CAfile /etc/rustfs/tls/ca.crt -untrusted /etc/rustfs/tls/rustfs_cert.pem /etc/rustfs/tls/rustfs_cert.pem`.
+
 ### Validate RustFS finds a usable server certificate
 
 **Symptom:** the play stops here with:
@@ -1014,6 +1050,37 @@ skips this check (it renders nothing) and reports from the variables.
 
 **Fix:** run without `--tags`, or include the stages that render the change
 (`--tags config,service`, `--tags install,config,service`).
+
+### Validate a cluster-wide change still reaches every cluster host
+
+**Symptom:** the play stops here with:
+
+```
+<value> change on <value>, but the cluster hosts <value> passed preflight
+and then failed in this run (also inside a block with rescue), so they keep
+the old values. These keys must change on every node together: <value> was
+not started or restarted. Fix the failure on those hosts, then run the play
+against the whole cluster again.
+```
+
+The first `<value>` lists key names only, for example `RUSTFS_RPC_SECRET`;
+the play output shows the earlier failure of the hosts named in the third.
+
+**Cause:** the run changes `RUSTFS_VOLUMES`, `RUSTFS_RPC_SECRET`, the root
+credentials, the IAM master key or its old keys, and every cluster host was
+in the run at preflight (otherwise
+[Validate cluster-wide changes include every cluster
+host](#validate-cluster-wide-changes-include-every-cluster-host) refuses),
+but a host failed later: a download or package error, a TLS check, a
+`rustfs tls inspect` failure. Restarting the others with the new values
+would cut that host off (RPC secret, layout) or let the nodes answer
+differently (credentials, IAM keys). A host that failed after the config
+stage has the new values in its files already, while its process runs the
+old ones.
+
+**Fix:** fix the failure on the named hosts, then run the play against the
+whole cluster: every node restarts onto the new values together (or rolls,
+for credentials and IAM keys).
 
 ---
 
@@ -1101,6 +1168,41 @@ five missing shards, and the set loses read and write quorum while the node
 restarts. The role does not compute which layouts survive: it refuses.
 
 **Fix:** see [A drive is offline](#a-drive-is-offline).
+
+### Validate no drive of another cluster host heals before restarting {{ __rustfs_node }}
+
+**Symptom:** the play stops here with:
+
+```
+refusing to restart <value>: a drive of another cluster host is still
+healing or could not be checked after <value> x <value> s (<value>). RustFS
+rebuilds a replaced drive after it stops listing it, and objects not rebuilt
+yet lack that shard: taking another node down can cost them their read
+quorum. Nothing was restarted on <value> or after it. Wait until the heal
+ends (TROUBLESHOOTING, "A drive is offline"), or set rustfs_rolling_restart:
+false to restart all changed nodes together in a maintenance window.
+```
+
+The fourth `<value>` lists each host and marker, for example
+`rustfs3 still has /data/rustfs2/.rustfs.sys/healing.bin`, or
+`rustfs3 could not be checked (...)` when the role could not reach the host
+or read the path.
+
+**Cause:** RustFS formats a replaced (or returning) drive and stops listing
+it in `/health/ready` before the erasure-set heal has rebuilt its shards,
+which takes hours on a full disk. While it runs, RustFS keeps
+`<drive>/.rustfs.sys/healing.bin` on that drive. Every object not rebuilt
+yet has one shard fewer: in four nodes with four drives each (one set of
+16, parity 4), the healing drive plus a restarting node is five missing
+shards for those objects, so reads of them fail while the node restarts.
+The role looks for the marker at every drive root of `rustfs_volumes` on
+every other cluster host, also on hosts outside `--limit`, and waits
+`rustfs_ready_retries` x `rustfs_ready_delay` before it refuses. A host it
+cannot reach or check refuses too.
+
+**Fix:** wait until the heal ends (the marker is gone and
+`rc admin heal status` shows no active task), then re-run the play. See
+[A drive is offline](#a-drive-is-offline).
 
 ### Fail because a peer did not re-admit {{ __rustfs_node }}
 
@@ -1195,10 +1297,17 @@ local erasure endpoints must use distinct physical disks; detected shared device
 **Cause:** two data dirs of this node resolve to the same block device
 (partitions or LVM volumes of one disk, or directories on one filesystem).
 RustFS refuses that layout because one disk failure would take out several
-erasure shards.
+erasure shards. Two or more drives of a node that are not mounted (a failed
+HBA, backplane or multipath device, a wrong `/etc/fstab` after a reboot)
+look the same: their empty mount point directories all sit on the root
+filesystem. One unmounted drive is still one offline drive
+([A drive is offline](#a-drive-is-offline)); two stop the node until they
+are mounted again.
 
-**Fix:** one physical disk per data dir. Only in test environments
-(containers, loop devices) set `rustfs_unsafe_bypass_disk_check: true`.
+**Fix:** one physical disk per data dir; mount drives that failed to mount
+again (`findmnt`, `journalctl -b -u '*.mount'`). Only in test environments
+whose data dirs are plain directories or loop devices on one disk set
+`rustfs_unsafe_bypass_disk_check: true`.
 
 ---
 
@@ -1240,14 +1349,19 @@ and run the play.
 nothing, because they still see the node online. The role refuses with
 `Validate the data dirs are mounted drives` on that node and with
 `Fail because a drive is offline before restarting <node>` on the others.
+With two or more drives of one node not mounted, the node does not start at
+all: see [Distinct physical disks](#distinct-physical-disks).
 
 **Cause:** a disk died, a mount failed at boot (`nofail` keeps the boot
 going), or a disk was pulled. The unit is ordered after the drive mounts but
-does not depend on them, so the node keeps serving on its other drives:
-one offline drive, not a node down. RustFS cannot write to the empty
-directory below the mount point (root-owned, see
+does not depend on them, so with one drive not mounted the node keeps
+serving on its other drives: one offline drive, not a node down. RustFS
+cannot write to the empty directory below the mount point (root-owned, see
 [INTEGRATION.md](INTEGRATION.md#preparing-the-drives)), so no object data
-lands on the root disk. A rolling restart now could cost an erasure set its
+lands on the root disk. A second unmounted drive of the same node shares the
+root disk with the first, and RustFS refuses to start
+(`local erasure endpoints must use distinct physical disks`): the node is
+down until the mounts are back. A rolling restart now could cost an erasure set its
 quorum, so the role does not start one. While the drive is missing,
 `/minio/health/cluster` can also answer 503 with `pool_meta_write_blocked`
 from time to time (a pool metadata replica is unreadable), and in a cluster
@@ -1267,7 +1381,7 @@ other nodes keep serving.
 3. Run the play for that node (`--limit <node>` is fine: nothing
    cluster-wide changes). It passes the mount guard and sets
    `rustfs:rustfs 0750` on the new filesystem; RustFS notices the writable
-   drive within seconds, formats it and heals it.
+   drive within seconds, formats it and starts to heal it.
 4. Wait until no node lists the drive any more, the node itself first:
 
    ```bash
@@ -1277,11 +1391,26 @@ other nodes keep serving.
    done
    ```
 
-5. Run the play against the whole cluster again for pending changes.
+   A drive that is no longer listed is formatted and online, not healed yet.
+5. Wait until the heal has ended. RustFS rebuilds every shard of the new
+   drive from the other drives of its erasure set, which takes hours on a
+   full disk, and keeps `<drive>/.rustfs.sys/healing.bin` on it meanwhile;
+   `/health/ready` does not show it. On the node of the drive:
 
-When the change cannot wait for the drive, run in a maintenance window with
-`rustfs_rolling_restart: false` (the changed nodes restart together; the
-node without the drive still refuses at its mount guard).
+   ```bash
+   ls /data/rustfs2/.rustfs.sys/healing.bin   # "No such file" once the heal has ended
+   rc admin heal status rustfs                # no active or queued task
+   ```
+
+   Until then the role's rolling restarts wait and then refuse with
+   `Validate no drive of another cluster host heals before restarting <node>`:
+   objects not rebuilt yet lack the new drive's shard, and another node
+   down can cost them their read quorum.
+6. Run the play against the whole cluster again for pending changes.
+
+When the change cannot wait for the drive or the heal, run in a maintenance
+window with `rustfs_rolling_restart: false` (the changed nodes restart
+together; the node without the drive still refuses at its mount guard).
 
 ---
 
