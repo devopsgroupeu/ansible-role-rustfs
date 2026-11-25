@@ -1,14 +1,18 @@
 ---
 # ==============================================================================
-# Install: service user, then the release zip as a versioned binary plus the
-# rustfs symlink. Preflight P6 has already refused an unmanaged binary at
+# Install: service user, package dependencies, then the release zip as a
+# versioned binary. Preflight P6 has already refused an unmanaged binary at
 # the symlink path and a downgrade.
-# A version is installed once: when its versioned binary exists, nothing is
-# downloaded and no temporary directory is created. Upstream publishes no
-# signature, so the SHA-256 (__rustfs_checksum_arg) is the integrity control,
-# and the extracted binary must report the expected version before it is
-# installed. A running process keeps the binary it was started from;
-# service.yml compares /proc/<pid>/exe with the versioned binary.
+# A version is installed once: a versioned binary whose SHA-256 matches the
+# digest file written when the role installed it is kept, and nothing is
+# downloaded. Any other versioned binary (missing, changed, or placed by
+# hand without the digest file) is downloaded and verified again. Upstream
+# publishes no signature, so the SHA-256 of the zip (__rustfs_checksum_arg)
+# is the integrity control, and the extracted binary must report the
+# expected version, run as the service user, before it is installed.
+# The rustfs symlink is not switched here: service.yml switches it per node
+# right before that node starts or restarts, so an aborted rollout leaves
+# the nodes it did not reach on their old binary, also for a crash restart.
 # ==============================================================================
 
 - name: Create the rustfs system group
@@ -30,37 +34,50 @@
     state: present
   tags: install
 
-# No checksum: the versioned file is renamed into place complete, so its
-# existence is the idempotence check.
-- name: Stat the versioned binary
+# On every run, not only with a download: community.crypto (the TLS stage)
+# needs python3-cryptography on every host.
+- name: Install package dependencies (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: "{{ __rustfs_pkg_deps['Debian'] }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: install
+
+- name: Install package dependencies (RHEL/EL)
+  ansible.builtin.dnf:
+    name: "{{ __rustfs_pkg_deps['RedHat'] }}"
+    state: present
+  when: ansible_facts['os_family'] == 'RedHat'
+  tags: install
+
+- name: Stat the versioned binary with its SHA-256
   ansible.builtin.stat:
     path: "{{ __rustfs_versioned_bin }}"
-    get_checksum: false
+    checksum_algorithm: sha256
   register: __rustfs_versioned_stat
   tags: install
 
-# tempfile has no check mode, so a check run skips the download; the symlink
-# task below then reports the pending version change.
+- name: Read the digest of the installed versioned binary
+  ansible.builtin.slurp:
+    src: "{{ __rustfs_versioned_digest_file }}"
+  register: __rustfs_versioned_digest
+  failed_when: false
+  when: __rustfs_versioned_stat['stat']['exists']
+  tags: install
+
+# tempfile has no check mode, so a check run skips the download; service.yml
+# then reports the pending version change.
 - name: Download, verify and install the versioned binary
   when:
-    - not __rustfs_versioned_stat['stat']['exists']
+    - >-
+      not __rustfs_versioned_stat['stat']['exists']
+      or (__rustfs_versioned_digest['content'] | default('') | b64decode | trim)
+         != __rustfs_versioned_stat['stat']['checksum']
     - not ansible_check_mode
   tags: install
   block:
-    - name: Install package dependencies (Debian/Ubuntu)
-      ansible.builtin.apt:
-        name: "{{ __rustfs_pkg_deps['Debian'] }}"
-        state: present
-        update_cache: true
-        cache_valid_time: 3600
-      when: ansible_facts['os_family'] == 'Debian'
-
-    - name: Install package dependencies (RHEL/EL)
-      ansible.builtin.dnf:
-        name: "{{ __rustfs_pkg_deps['RedHat'] }}"
-        state: present
-      when: ansible_facts['os_family'] == 'RedHat'
-
     # Inside rustfs_bin_dir, not /tmp: /tmp may be noexec (the version check
     # runs the extracted binary) or a small tmpfs (the gnu build needs about
     # 500 MB), while rustfs_bin_dir must allow execution anyway.
@@ -90,11 +107,25 @@
         include:
           - rustfs
 
+    # The version check runs the binary before anything else trusts it, so
+    # it runs as the unprivileged service user, not as root: the directory
+    # must let that user reach the binary (the zip itself stays 0600).
+    - name: Open the temporary download directory to the service user
+      ansible.builtin.file:
+        path: "{{ __rustfs_install_tmp['path'] }}"
+        state: directory
+        mode: "0755"
+
     - name: Read the version of the extracted binary
       ansible.builtin.command:
         argv:
+          - runuser
+          - -u
+          - "{{ rustfs_user }}"
+          - --
           - "{{ __rustfs_install_tmp['path'] }}/rustfs"
           - --version
+        chdir: "{{ __rustfs_install_tmp['path'] }}"
       register: __rustfs_install_version
       changed_when: false
 
@@ -118,8 +149,15 @@
           serve a different release under this name.
         quiet: true
 
+    - name: Stat the verified binary with its SHA-256
+      ansible.builtin.stat:
+        path: "{{ __rustfs_install_tmp['path'] }}/rustfs"
+        checksum_algorithm: sha256
+      register: __rustfs_install_stat
+
     # copy writes a temporary file next to the destination and renames it,
-    # so an existing versioned binary is always complete.
+    # so an existing versioned binary is always complete. A running process
+    # keeps the inode it was started from.
     - name: Install the versioned binary
       ansible.builtin.copy:
         src: "{{ __rustfs_install_tmp['path'] }}/rustfs"
@@ -129,18 +167,18 @@
         group: root
         mode: "0755"
 
+    # Written last: only a complete, verified install has its digest file.
+    - name: Record the digest of the versioned binary
+      ansible.builtin.copy:
+        content: "{{ __rustfs_install_stat['stat']['checksum'] }}\n"
+        dest: "{{ __rustfs_versioned_digest_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
   always:
     - name: Remove the temporary download directory
       ansible.builtin.file:
         path: "{{ __rustfs_install_tmp['path'] }}"
         state: absent
       when: __rustfs_install_tmp['path'] is defined
-
-# Atomic switch to the new version; running processes keep the old inode.
-- name: Point the rustfs symlink at the versioned binary
-  ansible.builtin.file:
-    src: "{{ __rustfs_versioned_bin }}"
-    dest: "{{ __rustfs_bin }}"
-    state: link
-    force: true
-  tags: install

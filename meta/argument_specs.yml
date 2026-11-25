@@ -25,8 +25,9 @@ argument_specs:
         default: "musl"
         choices: [musl, gnu]
         description: >
-          Build flavour of the release asset. 'musl' is static; 'gnu' needs
-          glibc >= 2.31 and adds profiling support.
+          Build flavour of the release asset. 'musl' is static and resolves
+          host names through /etc/hosts and DNS only (no NSS); 'gnu' needs
+          glibc >= 2.31, uses NSS and adds profiling support.
 
       rustfs_arch:
         type: str
@@ -42,7 +43,8 @@ argument_specs:
         default: "https://github.com/rustfs/rustfs/releases/download"
         description: >
           Download base URL; the role appends /<version>/<asset>. A mirror
-          must keep that layout.
+          must keep that layout. Plain http:// only with a pinned digest or
+          rustfs_checksum.
 
       rustfs_checksum:
         type: str
@@ -128,9 +130,9 @@ argument_specs:
         required: false
         default: true
         description: >
-          Refuse to continue unless every data dir is a mount point, and make
-          the unit refuse to start on an unmounted drive. False only for
-          dev/test.
+          Refuse to continue unless every data dir is a mount point, and order
+          the unit after the drive mounts (without depending on them). False
+          only for dev/test.
 
       rustfs_allow_volumes_change:
         type: bool
@@ -209,7 +211,9 @@ argument_specs:
         required: false
         default: ""
         no_log: true
-        description: REQUIRED. Root secret key (at least 8 characters). Source it from Ansible Vault.
+        description: >
+          REQUIRED. Root secret key (at least 8 characters, no surrounding
+          whitespace). Source it from Ansible Vault.
 
       rustfs_rpc_secret:
         type: str
@@ -227,7 +231,9 @@ argument_specs:
         no_log: true
         description: >
           IAM master key (RUSTFS_IAM_MASTER_KEY, secrets.env only). REQUIRED
-          in distributed mode, recommended everywhere; at least 32 characters.
+          in distributed mode, recommended everywhere; at least 32 characters,
+          no comma. A change needs the old key in
+          RUSTFS_IAM_MASTER_KEY_OLD_KEYS (two runs in a cluster).
 
       # ---- TLS ----
       rustfs_tls_enabled:
@@ -260,8 +266,9 @@ argument_specs:
         required: false
         default: false
         description: >
-          Trust the OS CA store for outbound and peer connections and for the
-          role's probes. When false, ca.crt in rustfs_tls_dir is required.
+          Also trust the OS CA store, in addition to ca.crt, for outbound and
+          peer connections; the role's probes use ca.crt when it exists, else
+          the OS store. When false, ca.crt in rustfs_tls_dir is required.
 
       # ---- Logging / extra environment ----
       rustfs_log_level:
@@ -313,8 +320,9 @@ argument_specs:
         required: false
         default: true
         description: >
-          Restart changed nodes one at a time with health gates. False
-          restarts all changed nodes together.
+          Restart changed nodes one at a time with health gates (every peer
+          ready and every drive online). False restarts all changed nodes
+          together.
 
       rustfs_ready_retries:
         type: int

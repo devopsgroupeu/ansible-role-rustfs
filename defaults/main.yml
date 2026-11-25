@@ -9,8 +9,10 @@
 # rustfs_allow_downgrade is true.
 rustfs_version: "1.0.6"
 
-# Build flavour of the release asset: "musl" (static binary, runs everywhere)
-# or "gnu" (needs glibc >= 2.31 on the target, adds profiling support).
+# Build flavour of the release asset: "musl" (static binary, no glibc needed;
+# resolves host names through /etc/hosts and DNS only, never through NSS
+# modules) or "gnu" (needs glibc >= 2.31 on the target, resolves through
+# NSS, adds profiling support).
 rustfs_libc: "musl"
 
 # Arch token of the release asset. Explicit x86_64/aarch64 map; any other
@@ -20,7 +22,8 @@ rustfs_arch: "{{ {'x86_64': 'x86_64', 'amd64': 'x86_64', 'aarch64': 'aarch64', '
 
 # Download base URL; the role appends /<version>/<asset>. A mirror must keep
 # that layout, and also serve SHA256SUMS there when no digest is pinned or
-# given in rustfs_checksum.
+# given in rustfs_checksum. Plain http:// is refused unless a pinned digest
+# or rustfs_checksum covers the version.
 rustfs_download_base_url: "https://github.com/rustfs/rustfs/releases/download"
 
 # Expected SHA-256 of the release zip (64 lowercase hex characters). Empty:
@@ -76,10 +79,11 @@ rustfs_volumes: []
 # rustfs_volumes; override per host only when pools use different paths.
 rustfs_data_dirs: "{{ __rustfs_volume_paths }}"
 
-# Refuse to continue unless every data dir is a mount point, and make the
-# unit refuse to start on an unmounted drive (RequiresMountsFor and
-# AssertPathIsMountPoint). Set false only for dev/test; the role then creates
-# the directories on whatever filesystem holds them.
+# Refuse to continue unless every data dir is a mount point, and order the
+# unit after the drive mounts without depending on them: a drive that fails
+# to mount later is one offline drive, not a node that stays down. Set false
+# only for dev/test; the role then creates the directories on whatever
+# filesystem holds them.
 rustfs_require_mounted_drives: true
 
 # Allow RUSTFS_VOLUMES or RUSTFS_ERASURE_SET_DRIVE_COUNT to differ from the
@@ -133,21 +137,24 @@ rustfs_server_domains: []
 # public default "rustfsadmin" is refused. Source it from Ansible Vault.
 rustfs_access_key: ""
 
-# REQUIRED. Root secret key, at least 8 characters, not "rustfsadmin" and not
-# equal to the access key. Source it from Ansible Vault.
+# REQUIRED. Root secret key, at least 8 characters, not "rustfsadmin", not
+# equal to the access key and without surrounding whitespace. Source it from
+# Ansible Vault.
 rustfs_secret_key: ""
 
 # Internode RPC secret. REQUIRED in distributed mode and identical on all
-# nodes; at least 8 characters and not equal to the secret key. Changing it
-# restarts the cluster together. Source it from Ansible Vault.
+# nodes; at least 8 characters, not equal to the secret key and without
+# surrounding whitespace. Changing it restarts the cluster together. Source
+# it from Ansible Vault.
 rustfs_rpc_secret: ""
 
 # IAM master key (RUSTFS_IAM_MASTER_KEY), rendered into secrets.env only.
 # Encrypts IAM data at rest and is required for MFA enrollment. REQUIRED in
-# distributed mode, recommended everywhere; at least 32 characters. Changing
-# it is a rolling restart: keep the old key in
-# rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] until every blob
-# is rewritten. Source it from Ansible Vault.
+# distributed mode, recommended everywhere; at least 32 characters, no comma,
+# no surrounding whitespace. A change keeps the old key in
+# rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] (refused
+# otherwise) and takes two runs in a cluster (README, "Rotating secrets").
+# Source it from Ansible Vault.
 rustfs_iam_master_key: ""
 
 # ==============================================================================
@@ -170,8 +177,10 @@ rustfs_tls_cert_validity: "+825d"
 # ("DNS:s3.example.com", "IP:10.0.0.10").
 rustfs_tls_extra_sans: []
 
-# Trust the OS CA store for outbound and peer connections and for the role's
-# probes. When false, ca.crt in rustfs_tls_dir is required.
+# Also trust the OS CA store, in addition to ca.crt, for outbound and peer
+# connections (RUSTFS_TRUST_SYSTEM_CA). The role's probes use ca.crt when it
+# exists, else the OS store. When false, ca.crt in rustfs_tls_dir is
+# required.
 rustfs_tls_trust_system_ca: false
 
 # ==============================================================================
@@ -210,12 +219,14 @@ rustfs_service_enabled: true
 # Desired service state: "started" or "stopped".
 rustfs_service_state: "started"
 
-# Restart changed nodes one at a time with health gates. False restarts all
-# changed nodes together (maintenance window, or a node is permanently down).
+# Restart changed nodes one at a time with health gates (every peer ready and
+# every drive online before a node goes down). False restarts all changed
+# nodes together (maintenance window, a node that is permanently down, or a
+# drive that stays offline).
 rustfs_rolling_restart: true
 
-# Attempts for every wait (new main process, /health/ready, peer
-# re-admission, cluster gate).
+# Attempts for every wait (new main process, /health/ready, drives online
+# before and after a rolling restart, cluster gate).
 rustfs_ready_retries: 60
 
 # Seconds between attempts of every wait.

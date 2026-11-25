@@ -2,71 +2,32 @@
 # ==============================================================================
 # Service: start, restart and enable the rustfs unit (spec 8.1). Not used in
 # render mode (rustfs_config_only).
-# There is no restart handler. Every run compares the running process with
-# the desired state instead: /proc/<MainPID>/exe must be the versioned binary
-# of rustfs_version, and /proc/<MainPID>/environ (the environment systemd
+# There is no restart handler. Every run compares the running process, which
+# preflight.yml read before anything changed, with the desired state
+# instead: /proc/<MainPID>/exe must be the versioned binary of rustfs_version
+# (same device and inode), /proc/<MainPID>/environ (the environment systemd
 # built from both env files at start) must hold every desired key with the
 # desired value, including the two markers of the env file (the sorted key
-# list and the unit digest). So a restart that an earlier run rendered but
-# never performed (a --tags config run, a run that died half way) happens on
-# the next run, exactly once, with the right mode:
+# list and the unit digest), and with TLS on the node must serve the
+# certificate on disk. So a restart that an earlier run rendered but never
+# performed (a --tags config run, a run that died half way) happens on the
+# next run, exactly once, with the right mode:
 #   - together (all changed nodes at once): RUSTFS_VOLUMES or
 #     RUSTFS_RPC_SECRET changed (old and new cannot coexist), the node is not
 #     serving yet, or rustfs_rolling_restart is false;
 #   - rolling (one node at a time, health gated, tasks/restart_node.yml):
 #     every other change.
-# Probes are read-only (check_mode: false, changed_when: false); uri calls and
-# waits are skipped in check mode, so a check run reports pending starts and
+# A start or restart loads the files and the binary on disk, not the role
+# variables, so a run in which they differ (the config or install stage did
+# not run) refuses instead of restarting without converging. The rustfs
+# symlink is switched per node right before that node starts or restarts.
+# Waits are skipped in check mode, so a check run reports pending starts and
 # restarts without performing them.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Probe the running process (steps 1 to 3)
+# What a start or restart would load (step 1)
 # ------------------------------------------------------------------------------
-
-# systemd_service and service_facts expose neither the main PID nor the
-# process environment, so the unit is queried directly (read only).
-- name: Probe the rustfs unit
-  ansible.builtin.command: systemctl show rustfs --property=ActiveState --property=MainPID # noqa: command-instead-of-module
-  register: __rustfs_unit_probe
-  check_mode: false
-  changed_when: false
-  tags: service
-
-# MainPID is 0 while no process runs (never started, stopped, failed, or
-# between two automatic restarts).
-- name: Read the main PID of the rustfs unit
-  ansible.builtin.set_fact:
-    __rustfs_main_pid: "{{ __rustfs_unit_probe['stdout'] | regex_findall('(?m)^MainPID=([0-9]+)$') | first | default('0') | int }}"
-  check_mode: false
-  changed_when: false
-  tags: service
-
-# lnk_target is the binary the process was started from; the kernel appends
-# " (deleted)" when that file was removed.
-- name: Read the binary of the running process
-  ansible.builtin.stat:
-    path: "/proc/{{ __rustfs_main_pid }}/exe"
-    follow: false
-    get_checksum: false
-  register: __rustfs_exe_stat
-  when: __rustfs_main_pid > 0
-  check_mode: false
-  changed_when: false
-  tags: service
-
-# Holds the secrets. A process that exits between the probe and this read
-# leaves no content, which the decision treats as "unreadable".
-- name: Read the environment of the running process
-  ansible.builtin.slurp:
-    src: "/proc/{{ __rustfs_main_pid }}/environ"
-  register: __rustfs_environ
-  when: __rustfs_main_pid > 0
-  failed_when: false
-  no_log: true
-  check_mode: false
-  changed_when: false
-  tags: service
 
 # The desired ANSIBLE_RUSTFS_UNIT_SHA256. Read here, not taken from
 # config.yml, so a run limited to --tags service decides on the unit on disk.
@@ -75,38 +36,76 @@
     path: "{{ __rustfs_unit_file }}"
     checksum_algorithm: sha256
   register: __rustfs_service_unit_stat
-  check_mode: false
-  changed_when: false
+  tags: service
+
+# preflight.yml read both files before config.yml rendered them; read them
+# again under the same register names, so __rustfs_file_env (vars/main.yml)
+# is what a restart loads now.
+- name: Read the env file on disk
+  ansible.builtin.slurp:
+    src: "{{ rustfs_env_file }}"
+  register: __rustfs_env_current
+  failed_when: false
+  tags: service
+
+- name: Read the secrets file on disk
+  ansible.builtin.slurp:
+    src: "{{ __rustfs_secrets_file }}"
+  register: __rustfs_secrets_current
+  failed_when: false
+  no_log: true
+  tags: service
+
+- name: Stat the versioned binary
+  ansible.builtin.stat:
+    path: "{{ __rustfs_versioned_bin }}"
+    get_checksum: false
+  register: __rustfs_service_bin_stat
+  tags: service
+
+- name: Stat the CA certificate for the health probes
+  ansible.builtin.stat:
+    path: "{{ __rustfs_tls_ca_file }}"
+    get_checksum: false
+  register: __rustfs_probe_ca_stat
+  when: rustfs_tls_enabled | bool
+  tags: service
+
+# Facts, because the rolling restart runs in the variable context of one
+# host and reads every node's own values through hostvars. The probes trust
+# ca.crt whenever it exists (RustFS trusts it too; rustfs_tls_trust_system_ca
+# only adds the OS store), else the OS store.
+- name: Set the rollout settings of this node
+  ansible.builtin.set_fact:
+    __rustfs_probe_ca: "{{ __rustfs_tls_ca_file if (__rustfs_probe_ca_stat['stat']['exists'] | default(false)) else '' }}"
+    __rustfs_probe_retries: "{{ rustfs_ready_retries | int }}"
+    __rustfs_probe_delay: "{{ rustfs_ready_delay | int }}"
+    __rustfs_versioned_bin_path: "{{ __rustfs_versioned_bin }}"
+    __rustfs_bin_path: "{{ __rustfs_bin }}"
   tags: service
 
 # ------------------------------------------------------------------------------
-# Decide (step 4). The running environment is a task variable, never a fact,
-# and the task is no_log; the facts hold key names only.
+# Decide (step 2). The environments are role vars (vars/main.yml), never
+# facts, and the task is no_log; the facts hold key names only.
 # ------------------------------------------------------------------------------
 
-- name: Decide whether RustFS needs a start or a restart
+- name: Compare RustFS with the desired state
   vars:
     __rustfs_active_state: "{{ __rustfs_unit_probe['stdout'] | regex_findall('(?m)^ActiveState=(.*)$') | first | default('') }}"
-    __rustfs_environ_read: "{{ __rustfs_main_pid > 0 and __rustfs_environ['content'] is defined }}"
-    # NUL-separated KEY=value entries; entries that are not a valid variable
-    # assignment are skipped. Inside {{ }} the regex escape takes one
-    # backslash.
-    __rustfs_running_env: >-
-      {{ dict(__rustfs_environ['content'] | default('') | b64decode
-              | regex_findall('(?:^|\x00)([A-Za-z_][A-Za-z0-9_]*)=([^\x00]*)')) }}
+    __rustfs_environ_read: "{{ __rustfs_main_pid | int > 0 and __rustfs_environ['content'] is defined }}"
     __rustfs_desired_env: >-
       {{ __rustfs_env | combine(__rustfs_secret_env)
          | combine({'ANSIBLE_RUSTFS_MANAGED_KEYS': __rustfs_managed_keys,
                     'ANSIBLE_RUSTFS_UNIT_SHA256': __rustfs_service_unit_stat['stat']['checksum'] | default('')}) }}
-    __rustfs_running_exe: "{{ __rustfs_exe_stat['stat']['lnk_target'] | default('') }}"
-    __rustfs_state_now: >-
-      {{ 'inactive' if __rustfs_main_pid == 0
-         else ('running' if (__rustfs_active_state == 'active' and __rustfs_environ_read) else 'starting') }}
+    __rustfs_binary_current: >-
+      {{ (__rustfs_exe_stat['stat']['exists'] | default(false)) and __rustfs_service_bin_stat['stat']['exists']
+         and __rustfs_exe_stat['stat']['dev'] == __rustfs_service_bin_stat['stat']['dev']
+         and __rustfs_exe_stat['stat']['inode'] == __rustfs_service_bin_stat['stat']['inode'] }}
     # Names, never values. An unreadable environment is one reason on its
     # own (comparing it would list every key).
     __rustfs_reasons_now: >-
       {%- set ns = namespace(out=[]) -%}
-      {%- if __rustfs_main_pid > 0 -%}
+      {%- if __rustfs_main_pid | int > 0 -%}
       {%-   if __rustfs_environ_read -%}
       {%-     for k, v in __rustfs_desired_env.items() if __rustfs_running_env.get(k) != v -%}
       {%-       set ns.out = ns.out + [k] -%}
@@ -114,28 +113,116 @@
       {%-   else -%}
       {%-     set ns.out = ['unreadable'] -%}
       {%-   endif -%}
-      {%-   if __rustfs_running_exe != __rustfs_versioned_bin -%}
+      {%-   if not __rustfs_binary_current -%}
       {%-     set ns.out = ns.out + ['binary'] -%}
       {%-   endif -%}
       {%- endif -%}
       {{ ns.out }}
+    # Keys whose value in the files on disk differs from the role variables.
+    __rustfs_stale_now: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for k, v in __rustfs_desired_env.items() if __rustfs_file_env.get(k) != v -%}
+      {%-   set ns.out = ns.out + [k] -%}
+      {%- endfor -%}
+      {%- for k in __rustfs_file_env if k not in __rustfs_desired_env -%}
+      {%-   set ns.out = ns.out + [k] -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  ansible.builtin.set_fact:
+    __rustfs_state: >-
+      {{ 'inactive' if __rustfs_main_pid | int == 0
+         else ('running' if (__rustfs_active_state == 'active' and __rustfs_environ_read) else 'starting') }}
+    __rustfs_change_reasons: "{{ __rustfs_reasons_now }}"
+    __rustfs_stale_keys: "{{ __rustfs_stale_now }}"
+  no_log: true
+  tags: service
+
+# A start or restart would load the files and the binary on disk. When they
+# do not match the variables (a --tags service run after a variable change,
+# without the config or install stage), restarting would not converge and
+# the next run would restart again. Check mode never renders, so it skips
+# this and reports from the variables.
+- name: Validate the files on disk match the role variables
+  ansible.builtin.assert:
+    that:
+      - __rustfs_stale_keys | length == 0
+      - __rustfs_service_bin_stat['stat']['exists']
+    fail_msg: >-
+      The files on {{ inventory_hostname }} do not match the role variables:
+      keys that differ in {{ rustfs_env_file }} or secrets.env:
+      {{ __rustfs_stale_keys }}; versioned binary {{ __rustfs_versioned_bin }}
+      {{ 'is installed' if __rustfs_service_bin_stat['stat']['exists'] else 'is missing' }}.
+      A start or restart loads the files and the binary on disk, so it would
+      not apply the variables. Nothing was started or restarted. Run the
+      install and config stages too (no --tags, or --tags
+      install,config,service).
+    quiet: true
+  when:
+    - rustfs_service_state == 'started'
+    - not ansible_check_mode
+  tags: service
+
+# ------------------------------------------------------------------------------
+# Served certificate (step 3)
+# ------------------------------------------------------------------------------
+
+# RustFS hot-reloads replaced TLS files, but rejects a certificate that drops
+# a name of the one it serves, or material with a file removed, and keeps
+# serving the old certificate (a WARN in the journal). Only for a running
+# node with no other change: a restart loads the files anyway.
+- name: Read the certificate file of this node
+  community.crypto.x509_certificate_info:
+    path: "{{ __rustfs_tls_cert_file }}"
+  register: __rustfs_cert_file_info
+  when:
+    - rustfs_tls_enabled | bool
+    - rustfs_service_state == 'started'
+    - __rustfs_state == 'running'
+    - __rustfs_change_reasons | length == 0
+  tags: service
+
+# Waits up to one reload interval for a replaced certificate (not in check
+# mode, where nothing was replaced).
+- name: Wait until the node serves the certificate file
+  community.crypto.get_certificate:
+    host: "{{ rustfs_node_address }}"
+    port: "{{ __rustfs_port | int }}"
+  register: __rustfs_served_cert
+  until: >-
+    (__rustfs_served_cert['serial_number'] | default(-1)) == __rustfs_cert_file_info['serial_number']
+    and (__rustfs_served_cert['not_after'] | default('')) == __rustfs_cert_file_info['not_after']
+  retries: "{{ 0 if ansible_check_mode else __rustfs_tls_reload_retries | int }}"
+  delay: 5
+  failed_when: false
+  when:
+    - rustfs_tls_enabled | bool
+    - rustfs_service_state == 'started'
+    - __rustfs_state == 'running'
+    - __rustfs_change_reasons | length == 0
+  # The module has no check mode; it only reads.
+  check_mode: false
+  tags: service
+
+- name: Decide whether RustFS needs a start or a restart
+  vars:
+    __rustfs_cert_stale: >-
+      {{ not (__rustfs_served_cert['skipped'] | default(false))
+         and ((__rustfs_served_cert['serial_number'] | default(-1)) != __rustfs_cert_file_info['serial_number']
+              or (__rustfs_served_cert['not_after'] | default('')) != __rustfs_cert_file_info['not_after']) }}
+    __rustfs_reasons_now: "{{ __rustfs_change_reasons + (['tls'] if __rustfs_cert_stale else []) }}"
     # A node that is to be stopped needs no restart.
     __rustfs_needed_now: >-
-      {{ rustfs_service_state == 'started' and __rustfs_state_now != 'inactive'
+      {{ rustfs_service_state == 'started' and __rustfs_state != 'inactive'
          and __rustfs_reasons_now | length > 0 }}
   ansible.builtin.set_fact:
-    __rustfs_state: "{{ __rustfs_state_now }}"
     __rustfs_restart_reasons: "{{ __rustfs_reasons_now }}"
     __rustfs_restart_needed: "{{ __rustfs_needed_now }}"
     __rustfs_restart_together: >-
       {{ __rustfs_needed_now
-         and (__rustfs_state_now == 'starting'
+         and (__rustfs_state == 'starting'
               or 'RUSTFS_VOLUMES' in __rustfs_reasons_now
               or 'RUSTFS_RPC_SECRET' in __rustfs_reasons_now
               or not rustfs_rolling_restart | bool) }}
-  no_log: true
-  check_mode: false
-  changed_when: false
   tags: service
 
 - name: Report why RustFS restarts
@@ -147,14 +234,17 @@
   tags: service
 
 # ------------------------------------------------------------------------------
-# TLS material check before any start or restart (step 6)
+# TLS material check before any start or restart (step 4)
 # ------------------------------------------------------------------------------
 
 # Exits 0 even without a usable certificate; the runtime mode line says so.
+# Runs the binary the node is about to start (the old one through the
+# symlink in check mode, when the new one is not installed). It parses the
+# files only; tls_byo.yml checks validity, SANs, EKU and the key match.
 - name: Inspect the TLS directory with the rustfs binary
   ansible.builtin.command:
     argv:
-      - "{{ __rustfs_bin }}"
+      - "{{ __rustfs_versioned_bin if __rustfs_service_bin_stat['stat']['exists'] else __rustfs_bin }}"
       - tls
       - inspect
       - --path
@@ -180,7 +270,7 @@
       - "'no-usable-server-cert' not in __rustfs_tls_inspect['stdout'] | default('')"
     fail_msg: >-
       RustFS finds no usable server certificate in {{ rustfs_tls_dir }} on
-      {{ inventory_hostname }} ({{ __rustfs_bin }} tls inspect, rc
+      {{ inventory_hostname }} ({{ __rustfs_tls_inspect['cmd'] | default([]) | first | default('rustfs') }} tls inspect, rc
       {{ __rustfs_tls_inspect['rc'] | default('none') }}): {{ __rustfs_tls_inspect_output }}.
       Nothing was started or restarted. Place a valid rustfs_cert.pem and
       the matching rustfs_key.pem there, or set rustfs_tls_generate_certs:
@@ -190,13 +280,23 @@
     - rustfs_tls_enabled | bool
     - rustfs_service_state == 'started'
     - __rustfs_state == 'inactive' or __rustfs_restart_needed
-  check_mode: false
-  changed_when: false
   tags: service
 
 # ------------------------------------------------------------------------------
-# Stop (step 7), start and together-restart (steps 8 to 10)
+# Symlink, stop (step 5), start and together-restart (steps 6 to 8)
 # ------------------------------------------------------------------------------
+
+# Every node except those waiting for a rolling restart, which
+# restart_node.yml switches right before their own restart: a node about to
+# start or restart together, a stopped node, a node without a change.
+- name: Point the rustfs symlink at the versioned binary
+  ansible.builtin.file:
+    src: "{{ __rustfs_versioned_bin }}"
+    dest: "{{ __rustfs_bin }}"
+    state: link
+    force: true
+  when: not (__rustfs_restart_needed and not __rustfs_restart_together)
+  tags: service
 
 - name: Stop RustFS
   ansible.builtin.systemd_service:
@@ -243,15 +343,18 @@
   tags: service
 
 # ------------------------------------------------------------------------------
-# Rolling restart (step 11): one node at a time, in play order
+# Rolling restart (step 9): one node at a time, in play order
 # ------------------------------------------------------------------------------
 
 # run_once plus loop runs restart_node.yml on one host, once per changed
-# node, strictly in sequence; its tasks delegate to the node. Without
-# any_errors_fatal a failure there would stop only the run_once host and the
-# other hosts would carry on. No when: here, because a run_once task skipped
-# on the first host is skipped for all; __rustfs_restart_needed is already
-# false on a host whose rustfs_service_state is stopped.
+# node, strictly in sequence and in play order, standalone nodes included,
+# so a failure stops the rollout of the whole play; its tasks delegate to
+# the node. Without any_errors_fatal a failure there would stop only the
+# run_once host and the other hosts would carry on. No when: here, because a
+# run_once task skipped on the first host is skipped for all;
+# __rustfs_restart_needed is already false on a host whose
+# rustfs_service_state is stopped, and validate.yml reset it on every host,
+# so a host whose run stopped early is never restarted on an old decision.
 - name: Roll the restart through the changed nodes
   any_errors_fatal: true
   tags: service
@@ -267,7 +370,7 @@
       run_once: true
 
 # ------------------------------------------------------------------------------
-# Boot state (step 12) and write quorum (step 13)
+# Boot state (step 10) and write quorum (step 11)
 # ------------------------------------------------------------------------------
 
 - name: Set whether RustFS starts at boot
@@ -276,18 +379,20 @@
     enabled: "{{ rustfs_service_enabled | bool }}"
   tags: service
 
-# /health/ready follows read quorum; writes need write and lock quorum.
+# /health/ready follows read quorum; writes need write and lock quorum. The
+# probes never use a proxy from the environment.
 - name: Wait for write quorum
   ansible.builtin.uri:
     url: "{{ __rustfs_node_url }}/minio/health/cluster"
     method: GET
     status_code: [200, 503]
     validate_certs: true
-    ca_path: "{{ __rustfs_probe_ca_path | default(omit, true) }}"
+    ca_path: "{{ __rustfs_probe_ca | default(omit, true) }}"
+    use_proxy: false
   register: __rustfs_cluster_health
   until: __rustfs_cluster_health['status'] == 200
-  retries: "{{ rustfs_ready_retries }}"
-  delay: "{{ rustfs_ready_delay }}"
+  retries: "{{ __rustfs_probe_retries }}"
+  delay: "{{ __rustfs_probe_delay }}"
   when:
     - rustfs_service_state == 'started'
     - not ansible_check_mode

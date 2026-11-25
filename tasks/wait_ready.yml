@@ -3,10 +3,10 @@
 # Wait until one node serves (spec 8.2). Inputs:
 #   __rustfs_wait_node     inventory name of the node
 #   __rustfs_wait_old_pid  main PID before a restart, 0 after a start
-# Every task delegates to the node and reads per-node values through
-# hostvars, so the same file serves the per-host wait of service.yml (the
-# node is the host itself) and the rolling restart (run_once host).
-# Skipped in check mode: nothing was started.
+# Every task delegates to the node and reads per-node values (node URL,
+# probe CA, retries, delay) through hostvars, so the same file serves the
+# per-host wait of service.yml (the node is the host itself) and the rolling
+# restart (run_once host). Skipped in check mode: nothing was started.
 # ==============================================================================
 
 - name: Wait until the node is ready
@@ -19,27 +19,29 @@
       ansible.builtin.command: systemctl show rustfs --property=MainPID --value # noqa: command-instead-of-module
       register: __rustfs_wait_pid
       until: (__rustfs_wait_pid['stdout'] | trim | int) not in [0, __rustfs_wait_old_pid | int]
-      retries: "{{ rustfs_ready_retries }}"
-      delay: "{{ rustfs_ready_delay }}"
+      retries: "{{ hostvars[__rustfs_wait_node]['__rustfs_probe_retries'] }}"
+      delay: "{{ hostvars[__rustfs_wait_node]['__rustfs_probe_delay'] }}"
       delegate_to: "{{ __rustfs_wait_node }}"
       check_mode: false
       changed_when: false
       tags: service
 
-    # 200 with "ready": true only after read quorum, IAM and lock quorum.
+    # 200 with "ready": true only after read quorum, IAM and lock quorum. The
+    # probe never uses a proxy from the environment.
     - name: Wait for /health/ready on {{ __rustfs_wait_node }}
       ansible.builtin.uri:
         url: "{{ hostvars[__rustfs_wait_node]['__rustfs_node_url'] }}/health/ready"
         method: GET
         status_code: [200, 503]
         validate_certs: true
-        ca_path: "{{ __rustfs_probe_ca_path | default(omit, true) }}"
+        ca_path: "{{ hostvars[__rustfs_wait_node]['__rustfs_probe_ca'] | default(omit, true) }}"
+        use_proxy: false
       register: __rustfs_wait_ready
       until: >-
         __rustfs_wait_ready['status'] == 200
         and (__rustfs_wait_ready['json']['ready'] | default(false))
-      retries: "{{ rustfs_ready_retries }}"
-      delay: "{{ rustfs_ready_delay }}"
+      retries: "{{ hostvars[__rustfs_wait_node]['__rustfs_probe_retries'] }}"
+      delay: "{{ hostvars[__rustfs_wait_node]['__rustfs_probe_delay'] }}"
       delegate_to: "{{ __rustfs_wait_node }}"
       check_mode: false
       changed_when: false
@@ -68,12 +70,14 @@
       ansible.builtin.fail:
         msg: >-
           RustFS on {{ __rustfs_wait_node }} did not become ready within
-          {{ rustfs_ready_retries }} x {{ rustfs_ready_delay }} s:
+          {{ hostvars[__rustfs_wait_node]['__rustfs_probe_retries'] }} x
+          {{ hostvars[__rustfs_wait_node]['__rustfs_probe_delay'] }} s:
           {{ __rustfs_wait_result }}. Check: every node of a new cluster runs
           in the same play (no serial, no --limit); the volume host names
-          resolve on every node; the clocks are in sync; the S3 port is
-          reachable between the nodes; the certificate SANs cover the node
-          names. Last journal lines:
+          resolve on every node (with the musl build through DNS or
+          /etc/hosts only); the clocks are in sync; the S3 port is reachable
+          between the nodes; the certificate SANs cover the node names. Last
+          journal lines:
           {{ __rustfs_wait_journal['stdout'] | default('') }}
       delegate_to: "{{ __rustfs_wait_node }}"
       tags: service

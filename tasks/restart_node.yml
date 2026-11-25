@@ -4,14 +4,17 @@
 # run_once and a loop, so nodes restart strictly one after another. Input:
 #   __rustfs_node  inventory name of the node to restart
 # The task context is the run_once host: every task delegates to the node and
-# reads per-node values (peer URLs, main PID, node URL) through hostvars.
-# Every failure message names the node.
+# reads per-node values (peer URLs, main PID, probe CA, retries) through
+# hostvars. Every failure message names the node.
 # Peers (distributed only; a standalone node has none) are probed from the
-# restarting node before and after its restart: all must be ready before it
-# goes down, and afterwards each must stop listing more of its unavailable
-# or missing drives than before (re-admission).
-# Drive keys are "<poolIndex>/<setIndex>/<diskIndex>" of
-# details.storage.unavailableDrives plus details.storage.missingDrives.
+# restarting node. /health/ready only says a peer can serve reads now, not
+# that the cluster survives losing this node too, and RustFS has no
+# maintenance probe. So the node goes down only when every peer is ready and
+# lists no unavailable or missing drive (details.storage): with a drive
+# already offline, taking a node down can cost an erasure set its read or
+# write quorum. After the restart every peer must list no drive again
+# (re-admission) before the next node goes down.
+# Drive keys in messages are "<poolIndex>/<setIndex>/<diskIndex>".
 # ==============================================================================
 
 - name: Probe the peers before restarting {{ __rustfs_node }}
@@ -20,7 +23,8 @@
     method: GET
     status_code: [200, 503]
     validate_certs: true
-    ca_path: "{{ __rustfs_probe_ca_path | default(omit, true) }}"
+    ca_path: "{{ hostvars[__rustfs_node]['__rustfs_probe_ca'] | default(omit, true) }}"
+    use_proxy: false
   loop: "{{ hostvars[__rustfs_node]['__rustfs_peer_urls'] }}"
   loop_control:
     label: "{{ item['name'] }}"
@@ -32,10 +36,10 @@
   changed_when: false
   tags: service
 
-# A peer that is not ready refuses the restart of this node and of every
-# node after it, so a bad change or a dead peer stops at one node at most.
-# A ready peer without details.storage fails closed: re-admission could not
-# be checked.
+# A peer that is down refuses the restart of this node and of every node
+# after it at once, so a bad change or a dead peer stops at one node at
+# most. A ready peer without details.storage fails closed: the drives could
+# not be checked.
 - name: Validate every peer is ready before restarting {{ __rustfs_node }}
   vars:
     __rustfs_peers_not_ready: >-
@@ -65,27 +69,74 @@
     quiet: true
   when: not ansible_check_mode
   delegate_to: "{{ __rustfs_node }}"
-  check_mode: false
-  changed_when: false
   tags: service
 
-- name: Record the drive baseline of the peers of {{ __rustfs_node }}
-  ansible.builtin.set_fact:
-    __rustfs_peer_baseline: >-
-      {%- set ns = namespace(out={}) -%}
-      {%- for r in __rustfs_peer_before['results'] | default([]) if r['item'] is defined -%}
-      {%-   set drives = r['json']['details']['storage']['unavailableDrives']
-                         + r['json']['details']['storage']['missingDrives'] -%}
-      {%-   set keys = drives | map(attribute='poolIndex')
-                       | zip(drives | map(attribute='setIndex'), drives | map(attribute='diskIndex'))
-                       | map('join', '/') | list -%}
-      {%-   set ns.out = ns.out | combine({r['item']['name']: keys}) -%}
-      {%- endfor -%}
-      {{ ns.out }}
+# Waits, because a peer can still list the drives of a node that started or
+# restarted moments ago; a drive that stays offline refuses the restart.
+- name: Block until every drive is online before restarting {{ __rustfs_node }}
   when: not ansible_check_mode
+  tags: service
+  block:
+    - name: Wait until every peer reports every drive online before restarting {{ __rustfs_node }}
+      ansible.builtin.uri:
+        url: "{{ item['url'] }}/health/ready"
+        method: GET
+        status_code: [200, 503]
+        validate_certs: true
+        ca_path: "{{ hostvars[__rustfs_node]['__rustfs_probe_ca'] | default(omit, true) }}"
+        use_proxy: false
+      loop: "{{ hostvars[__rustfs_node]['__rustfs_peer_urls'] }}"
+      loop_control:
+        label: "{{ item['name'] }}"
+      register: __rustfs_peer_drives
+      until: >-
+        __rustfs_peer_drives['status'] == 200
+        and (__rustfs_peer_drives['json']['ready'] | default(false))
+        and (__rustfs_peer_drives['json']['details']['storage']['unavailableDrives'] | default(['?'])) | length == 0
+        and (__rustfs_peer_drives['json']['details']['storage']['missingDrives'] | default(['?'])) | length == 0
+      retries: "{{ hostvars[__rustfs_node]['__rustfs_probe_retries'] }}"
+      delay: "{{ hostvars[__rustfs_node]['__rustfs_probe_delay'] }}"
+      delegate_to: "{{ __rustfs_node }}"
+      check_mode: false
+      changed_when: false
+      tags: service
+  rescue:
+    - name: Fail because a drive is offline before restarting {{ __rustfs_node }}
+      vars:
+        __rustfs_peers_offline: >-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for r in ansible_failed_result['results'] | default([]) if r['failed'] | default(false) -%}
+          {%-   set storage = ((r['json'] | default({}))['details'] | default({}))['storage'] | default({}) -%}
+          {%-   set drives = (storage['unavailableDrives'] | default([])) + (storage['missingDrives'] | default([])) -%}
+          {%-   set ns.out = ns.out + [r['item']['name'] ~ ' (status ' ~ (r['status'] | default('none')) ~ '): '
+                                       ~ (drives | map(attribute='poolIndex') | zip(drives | map(attribute='setIndex'),
+                                                                                       drives | map(attribute='diskIndex'))
+                                          | map('join', '/') | join(', ') or 'not ready')] -%}
+          {%- endfor -%}
+          {{ ns.out | join('; ') }}
+      ansible.builtin.fail:
+        msg: >-
+          refusing to restart {{ __rustfs_node }}: its peers still list drives as
+          unavailable or missing after
+          {{ hostvars[__rustfs_node]['__rustfs_probe_retries'] }} x {{ hostvars[__rustfs_node]['__rustfs_probe_delay'] }} s
+          ({{ __rustfs_peers_offline }}). With a drive offline, taking another
+          node down can cost an erasure set its read or write quorum. Nothing
+          was restarted on {{ __rustfs_node }} or after it. Bring the drive
+          back or replace it (TROUBLESHOOTING, "A drive is offline"), or set
+          rustfs_rolling_restart: false to restart all changed nodes together
+          in a maintenance window.
+      delegate_to: "{{ __rustfs_node }}"
+      tags: service
+
+# The symlink of a node waiting for its rolling restart was left on the old
+# binary (service.yml); switch it right before this restart.
+- name: Point the rustfs symlink at the versioned binary on {{ __rustfs_node }}
+  ansible.builtin.file:
+    src: "{{ hostvars[__rustfs_node]['__rustfs_versioned_bin_path'] }}"
+    dest: "{{ hostvars[__rustfs_node]['__rustfs_bin_path'] }}"
+    state: link
+    force: true
   delegate_to: "{{ __rustfs_node }}"
-  check_mode: false
-  changed_when: false
   tags: service
 
 - name: Restart RustFS on {{ __rustfs_node }}
@@ -105,8 +156,8 @@
   tags: service
 
 # A node's own /health/ready says it can reach the cluster, not that the
-# cluster reaches it again: wait until no peer lists more unavailable or
-# missing drives than in its baseline.
+# cluster reaches it again: wait until no peer lists an unavailable or
+# missing drive.
 - name: Block until every peer re-admits {{ __rustfs_node }}
   when: not ansible_check_mode
   tags: service
@@ -117,7 +168,8 @@
         method: GET
         status_code: [200, 503]
         validate_certs: true
-        ca_path: "{{ __rustfs_probe_ca_path | default(omit, true) }}"
+        ca_path: "{{ hostvars[__rustfs_node]['__rustfs_probe_ca'] | default(omit, true) }}"
+        use_proxy: false
       loop: "{{ hostvars[__rustfs_node]['__rustfs_peer_urls'] }}"
       loop_control:
         label: "{{ item['name'] }}"
@@ -125,18 +177,10 @@
       until: >-
         __rustfs_peer_after['status'] == 200
         and (__rustfs_peer_after['json']['ready'] | default(false))
-        and (((__rustfs_peer_after['json']['details']['storage']['unavailableDrives'] | default([]))
-              + (__rustfs_peer_after['json']['details']['storage']['missingDrives'] | default([])))
-             | map(attribute='poolIndex')
-             | zip(((__rustfs_peer_after['json']['details']['storage']['unavailableDrives'] | default([]))
-                    + (__rustfs_peer_after['json']['details']['storage']['missingDrives'] | default([])))
-                   | map(attribute='setIndex'),
-                   ((__rustfs_peer_after['json']['details']['storage']['unavailableDrives'] | default([]))
-                    + (__rustfs_peer_after['json']['details']['storage']['missingDrives'] | default([])))
-                   | map(attribute='diskIndex'))
-             | map('join', '/') | list) is subset(__rustfs_peer_baseline[item['name']])
-      retries: "{{ rustfs_ready_retries }}"
-      delay: "{{ rustfs_ready_delay }}"
+        and (__rustfs_peer_after['json']['details']['storage']['unavailableDrives'] | default(['?'])) | length == 0
+        and (__rustfs_peer_after['json']['details']['storage']['missingDrives'] | default(['?'])) | length == 0
+      retries: "{{ hostvars[__rustfs_node]['__rustfs_probe_retries'] }}"
+      delay: "{{ hostvars[__rustfs_node]['__rustfs_probe_delay'] }}"
       delegate_to: "{{ __rustfs_node }}"
       check_mode: false
       changed_when: false
@@ -150,10 +194,11 @@
       ansible.builtin.fail:
         msg: >-
           {{ __rustfs_node }} restarted and is ready, but its peers did not
-          re-admit it within {{ rustfs_ready_retries }} x {{ rustfs_ready_delay }} s:
-          {{ __rustfs_peers_lagging }} still report it unavailable (drive baseline before the restart:
-          {{ __rustfs_peer_baseline }}). The rollout stopped here; the nodes
-          after {{ __rustfs_node }} were not restarted. Check the network
-          between the nodes, then re-run the play to resume.
+          re-admit it within {{ hostvars[__rustfs_node]['__rustfs_probe_retries'] }} x
+          {{ hostvars[__rustfs_node]['__rustfs_probe_delay'] }} s:
+          {{ __rustfs_peers_lagging }} still list a drive as unavailable or
+          missing. The rollout stopped here; the nodes after
+          {{ __rustfs_node }} were not restarted. Check the network between
+          the nodes, then re-run the play to resume.
       delegate_to: "{{ __rustfs_node }}"
       tags: service

@@ -4,17 +4,24 @@
 [Unit]
 Description=RustFS Object Storage Server
 Documentation=https://docs.rustfs.com
+# No default dependencies: with them multi-user.target would wait for this
+# unit, and a node that waits for quorum would keep the boot "starting". The
+# defaults of a service are restored explicitly.
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target basic.target
+Conflicts=shutdown.target
+Before=shutdown.target
 Wants=network-online.target
 After=network-online.target
+{% if rustfs_require_mounted_drives | bool %}
+# Start after the drive mounts, but do not depend on them: a drive that is
+# not mounted is one offline drive for RustFS (its root-owned mount point
+# directory is not writable for the service user), not a node that is down.
+After={{ __rustfs_mount_units['stdout_lines'] | join(' ') }}
+{% endif %}
 AssertFileIsExecutable={{ __rustfs_bin }}
 ConditionFileNotEmpty={{ rustfs_env_file }}
-{% if rustfs_require_mounted_drives | bool %}
-# Never write object data to the root disk when a drive is not mounted.
-RequiresMountsFor={{ rustfs_data_dirs | join(' ') }}
-{% for dir in rustfs_data_dirs %}
-AssertPathIsMountPoint={{ dir }}
-{% endfor %}
-{% endif %}
 
 [Service]
 Type=notify

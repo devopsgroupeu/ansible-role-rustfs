@@ -1,12 +1,20 @@
 ---
 # ==============================================================================
-# Preflight: read-only host-state guards (P1 to P8). Run after validate.yml
+# Preflight: read-only host-state guards (P1 to P10). Run after validate.yml
 # and before anything is installed or rendered, tagged always, so no tag
 # selection can bypass them. A host that fails a guard is left untouched.
-# P1 to P4, P6 and P7 inspect the host and are skipped in render mode
-# (rustfs_config_only); P5 (layout) and P8 (BYO TLS files) also run there.
-# Registers read by later files: __rustfs_env_stat and __rustfs_env_current
-# (P5), __rustfs_tls_byo_stat (P8, used by tls_byo.yml).
+# P1 to P4, P6, P7, P9 and P10 inspect the host or the running process and
+# are skipped in render mode (rustfs_config_only); P5 (layout) and P8 (BYO
+# TLS files) also run there.
+# The probes of the running process and of the deployed files live here,
+# before the guards that compare with them, and only read. service.yml
+# decides restarts from the same registers: __rustfs_unit_probe,
+# __rustfs_main_pid, __rustfs_exe_stat and __rustfs_environ (the process;
+# vars/main.yml __rustfs_running_env), __rustfs_env_current and
+# __rustfs_secrets_current (the files; __rustfs_file_env).
+# __rustfs_tls_byo_stat (P8) is reused by tls_byo.yml.
+# P7 and P10 compare hosts. They fail closed when a host of the play has not
+# reached them yet, which happens only outside the linear strategy.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -24,8 +32,6 @@
       systemd unit and supports systemd hosts only.
     quiet: true
   when: not rustfs_config_only | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 # getconf fails on a host without glibc (musl based); the assert then says so.
@@ -56,8 +62,6 @@
   when:
     - not rustfs_config_only | bool
     - rustfs_libc == 'gnu'
-  check_mode: false
-  changed_when: false
   tags: always
 
 - name: Check that every data dir is a mount point
@@ -78,6 +82,9 @@
   changed_when: false
   tags: always
 
+# config.yml sets the owner of every data dir; only a mounted filesystem
+# root may get it. The unmounted directory below a mount point stays
+# root-owned, so a drive that is missing later is not writable for RustFS.
 - name: Validate the data dirs are mounted drives
   vars:
     __rustfs_unmounted: "{{ __rustfs_mountpoints['results'] | default([]) | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
@@ -94,8 +101,6 @@
   when:
     - not rustfs_config_only | bool
     - rustfs_require_mounted_drives | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 # systemd follows symlinks for ReadWritePaths, so the stat follows them too.
@@ -109,8 +114,6 @@
     label: "{{ item }}"
   register: __rustfs_rw_path_stat
   when: not rustfs_config_only | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 - name: Validate the extra read-write paths exist
@@ -128,68 +131,141 @@
       the list.
     quiet: true
   when: not rustfs_config_only | bool
+  tags: always
+
+# ------------------------------------------------------------------------------
+# The running process and the deployed files (read only)
+# ------------------------------------------------------------------------------
+
+# systemd_service and service_facts expose neither the main PID nor the
+# process environment, so the unit is queried directly.
+- name: Probe the rustfs unit
+  ansible.builtin.command: systemctl show rustfs --property=ActiveState --property=MainPID # noqa: command-instead-of-module
+  register: __rustfs_unit_probe
+  when: not rustfs_config_only | bool
   check_mode: false
   changed_when: false
   tags: always
 
-# ------------------------------------------------------------------------------
-# P5: layout guard (render mode too)
-# ------------------------------------------------------------------------------
+# 0 while no process runs (never started, stopped, failed, between two
+# automatic restarts, or render mode).
+- name: Read the main PID of the rustfs unit
+  ansible.builtin.set_fact:
+    __rustfs_main_pid: "{{ __rustfs_unit_probe['stdout'] | default('') | regex_findall('(?m)^MainPID=([0-9]+)$') | first | default('0') | int }}"
+  tags: always
 
-- name: Stat the deployed env file
+# Followed to the file the process runs: service.yml compares device and
+# inode, because the kernel reports canonical paths and a path string would
+# never match a symlinked rustfs_bin_dir.
+- name: Stat the binary of the running process
   ansible.builtin.stat:
-    path: "{{ rustfs_env_file }}"
+    path: "/proc/{{ __rustfs_main_pid }}/exe"
+    follow: true
     get_checksum: false
-  register: __rustfs_env_stat
-  check_mode: false
-  changed_when: false
+  register: __rustfs_exe_stat
+  when: __rustfs_main_pid | int > 0
+  tags: always
+
+# Holds the secrets. A process that exits between the probe and this read
+# leaves no content, which the restart decision treats as "unreadable".
+- name: Read the environment of the running process
+  ansible.builtin.slurp:
+    src: "/proc/{{ __rustfs_main_pid }}/environ"
+  register: __rustfs_environ
+  when: __rustfs_main_pid | int > 0
+  failed_when: false
+  no_log: true
+  tags: always
+
+- name: Stat the deployed env files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - "{{ rustfs_env_file }}"
+    - "{{ __rustfs_secrets_file }}"
+  loop_control:
+    label: "{{ item }}"
+  register: __rustfs_env_files_stat
   tags: always
 
 - name: Read the deployed env file
   ansible.builtin.slurp:
     src: "{{ rustfs_env_file }}"
   register: __rustfs_env_current
-  when: __rustfs_env_stat['stat']['exists']
-  check_mode: false
-  changed_when: false
+  when: __rustfs_env_files_stat['results'][0]['stat']['exists']
   tags: always
 
-# systemd takes the last assignment of a key; the value may be quoted or not
-# (an env file the role did not write).
+- name: Read the deployed secrets file
+  ansible.builtin.slurp:
+    src: "{{ __rustfs_secrets_file }}"
+  register: __rustfs_secrets_current
+  when: __rustfs_env_files_stat['results'][1]['stat']['exists']
+  no_log: true
+  tags: always
+
+# A formatted drive holds .rustfs.sys/format.json: this node belongs to a
+# cluster that was bootstrapped, whatever the env files say (P5 and P7). A
+# fact, because P7 reads it from the other hosts.
+- name: Look for a formatted drive
+  ansible.builtin.stat:
+    path: "{{ item }}/.rustfs.sys/format.json"
+    get_checksum: false
+  loop: "{{ rustfs_data_dirs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: __rustfs_format_stat
+  tags: always
+
+- name: Record whether a drive is formatted
+  ansible.builtin.set_fact:
+    __rustfs_formatted: "{{ __rustfs_format_stat['results'] | selectattr('stat.exists') | list | length > 0 }}"
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P5: layout guard (render mode too)
+# ------------------------------------------------------------------------------
+
+# Compared with the env file and, while a process runs, with its
+# environment: the env file can be gone, moved with rustfs_env_file, or newer
+# than the process. Without either, a formatted drive still proves a layout
+# that cannot be compared.
 - name: Validate the volume layout is unchanged
   vars:
-    __rustfs_deployed_env: "{{ __rustfs_env_current['content'] | b64decode }}"
-    __rustfs_deployed_volumes: >-
-      {{ __rustfs_deployed_env | regex_findall('(?m)^RUSTFS_VOLUMES=(.*)$') | last | default('') | trim('"') }}
-    __rustfs_deployed_set_size: >-
-      {{ __rustfs_deployed_env | regex_findall('(?m)^RUSTFS_ERASURE_SET_DRIVE_COUNT=(.*)$') | last | default('') | trim('"') }}
     __rustfs_desired_set_size: "{{ rustfs_extra_env['RUSTFS_ERASURE_SET_DRIVE_COUNT'] | default('') }}"
+    __rustfs_layout_sources: >-
+      {{ ([{'name': rustfs_env_file, 'env': __rustfs_file_env}] if __rustfs_env_files_stat['results'][0]['stat']['exists'] else [])
+         + ([{'name': 'the running process', 'env': __rustfs_running_env}] if __rustfs_running_env | length > 0 else []) }}
     # Only the values that differ.
     __rustfs_layout_diff: >-
-      {{ [('RUSTFS_VOLUMES deployed "' ~ __rustfs_deployed_volumes ~ '", desired "' ~ __rustfs_volumes_string ~ '"')
-          if __rustfs_deployed_volumes != __rustfs_volumes_string else '',
-          ('RUSTFS_ERASURE_SET_DRIVE_COUNT deployed "' ~ (__rustfs_deployed_set_size or 'unset')
-           ~ '", desired "' ~ (__rustfs_desired_set_size or 'unset') ~ '"')
-          if __rustfs_deployed_set_size != __rustfs_desired_set_size else '']
-         | select | join('; ') }}
+      {%- set ns = namespace(out=[]) -%}
+      {%- for src in __rustfs_layout_sources -%}
+      {%-   for key, want in [['RUSTFS_VOLUMES', __rustfs_volumes_string],
+                              ['RUSTFS_ERASURE_SET_DRIVE_COUNT', __rustfs_desired_set_size]] -%}
+      {%-     set have = src['env'][key] | default('') -%}
+      {%-     if have != want -%}
+      {%-       set ns.out = ns.out + [key ~ ' in ' ~ src['name'] ~ ' "' ~ (have or 'unset')
+                                       ~ '", desired "' ~ (want or 'unset') ~ '"'] -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {%- if __rustfs_layout_sources | length == 0 and __rustfs_formatted -%}
+      {%-   set ns.out = ['a data dir holds a formatted RustFS drive (.rustfs.sys/format.json), but neither '
+                          ~ rustfs_env_file ~ ' nor a running process shows the layout it belongs to'] -%}
+      {%- endif -%}
+      {{ ns.out | join('; ') }}
   ansible.builtin.assert:
     that:
-      - >-
-        rustfs_allow_volumes_change | bool
-        or (__rustfs_deployed_volumes == __rustfs_volumes_string
-            and __rustfs_deployed_set_size == __rustfs_desired_set_size)
+      - rustfs_allow_volumes_change | bool or __rustfs_layout_diff == ''
     fail_msg: >-
-      The storage layout differs from the one deployed in {{ rustfs_env_file }}:
-      {{ __rustfs_layout_diff }}. Nothing was changed. The pool layout and the
-      erasure set size of an initialised pool are immutable: RustFS refuses to
-      start on a different layout, and reordered or resized pools can lose
-      data. The only legitimate volumes change is appending a pool or removing
-      a decommissioned pool. For that, set rustfs_allow_volumes_change: true
+      The storage layout differs from the deployed one: {{ __rustfs_layout_diff }}.
+      Nothing was changed. The pool layout and the erasure set size of an
+      initialised pool are immutable: RustFS refuses to start on a different
+      layout, and reordered or resized pools can lose data. The only
+      legitimate volumes change is appending a pool or removing a
+      decommissioned pool. For that, set rustfs_allow_volumes_change: true
       for this run; the changed nodes are then restarted together.
     quiet: true
-  when: __rustfs_env_stat['stat']['exists']
-  check_mode: false
-  changed_when: false
   tags: always
 
 # ------------------------------------------------------------------------------
@@ -203,8 +279,6 @@
     get_checksum: false
   register: __rustfs_bin_stat
   when: not rustfs_config_only | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 # The role installs __rustfs_bin as a symlink to
@@ -218,8 +292,6 @@
                          ~ '/rustfs-([0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.]+)?)-(?:musl|gnu)$')
          | first | default('') }}
   when: not rustfs_config_only | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 - name: Validate no unmanaged binary sits at the binary path
@@ -240,8 +312,6 @@
       directory.
     quiet: true
   when: not rustfs_config_only | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 - name: Validate rustfs_version is not a downgrade
@@ -259,8 +329,6 @@
     - not rustfs_config_only | bool
     - not rustfs_allow_downgrade | bool
     - __rustfs_installed_version | default('') != ''
-  check_mode: false
-  changed_when: false
   tags: always
 
 # ------------------------------------------------------------------------------
@@ -269,19 +337,23 @@
 
 # Evaluated on every host (no run_once), so every host reports it. A host
 # that failed an earlier task has left ansible_play_hosts and counts as
-# missing.
+# missing. The marker is a formatted drive, not the env file: a first run
+# that failed after rendering is still a first bootstrap. A host that has
+# not set the fact in this run (validate.yml resets it) counts as not
+# formatted, so this check fails closed.
 - name: Validate the first bootstrap includes every cluster host
   vars:
-    __rustfs_deployed_hosts: >-
-      {{ ansible_play_hosts | map('extract', hostvars) | selectattr('__rustfs_env_stat', 'defined')
-         | selectattr('__rustfs_env_stat.stat.exists') | map(attribute='inventory_hostname') | list }}
+    __rustfs_formatted_hosts: >-
+      {{ ansible_play_hosts | intersect(rustfs_cluster_hosts) | map('extract', hostvars)
+         | selectattr('__rustfs_formatted', 'defined') | selectattr('__rustfs_formatted')
+         | map(attribute='inventory_hostname') | list }}
     __rustfs_absent_hosts: "{{ rustfs_cluster_hosts | difference(ansible_play_hosts) }}"
   ansible.builtin.assert:
     that:
-      - __rustfs_deployed_hosts | length > 0 or __rustfs_absent_hosts | length == 0
+      - __rustfs_formatted_hosts | length > 0 or __rustfs_absent_hosts | length == 0
     fail_msg: >-
-      First bootstrap: no host of this play has {{ rustfs_env_file }} yet, but
-      the cluster hosts {{ __rustfs_absent_hosts }} are not in the play. A new
+      First bootstrap: no host of this play has a formatted drive yet, but the
+      cluster hosts {{ __rustfs_absent_hosts }} are not in the play. A new
       cluster starts only when every node of rustfs_cluster_hosts runs in the
       same play (no --limit, no failed or unreachable hosts). Adding or
       replacing a node in a running cluster is also done by running the play
@@ -290,8 +362,6 @@
   when:
     - not rustfs_config_only | bool
     - __rustfs_distributed | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 # ------------------------------------------------------------------------------
@@ -315,8 +385,6 @@
   when:
     - rustfs_tls_enabled | bool
     - not rustfs_tls_generate_certs | bool
-  check_mode: false
-  changed_when: false
   tags: always
 
 # ca.crt is optional only with rustfs_tls_trust_system_ca.
@@ -346,6 +414,121 @@
   when:
     - rustfs_tls_enabled | bool
     - not rustfs_tls_generate_certs | bool
-  check_mode: false
-  changed_when: false
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P9: cluster-wide changes need the whole cluster (distributed only)
+# ------------------------------------------------------------------------------
+
+# Every host that gets here sets this; P9 and P10 read it from the others. A
+# host that failed an earlier guard, also inside a block with rescue (which
+# keeps it in the play), has not set it in this run.
+- name: Record that this host passed the host guards
+  ansible.builtin.set_fact:
+    __rustfs_preflight_done: true
+  tags: always
+
+# --limit, or a failed, rescued or unreachable host, leaves cluster hosts
+# out of the run, and they keep their old values: a node with another RPC
+# secret or layout is cut off from its peers, nodes with other root
+# credentials or IAM keys answer differently. Day-2 work that changes none of
+# these keys is fine with --limit. Key names only in the message, never
+# values.
+- name: Validate cluster-wide changes include every cluster host
+  vars:
+    __rustfs_absent_hosts: >-
+      {{ rustfs_cluster_hosts | difference(ansible_play_hosts | map('extract', hostvars)
+         | selectattr('__rustfs_preflight_done', 'defined') | selectattr('__rustfs_preflight_done')
+         | map(attribute='inventory_hostname') | list) | sort }}
+    __rustfs_desired_all: "{{ __rustfs_env | combine(__rustfs_secret_env) }}"
+    __rustfs_cluster_keys_changed: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for key in ['RUSTFS_VOLUMES', 'RUSTFS_RPC_SECRET', 'RUSTFS_ACCESS_KEY', 'RUSTFS_SECRET_KEY',
+                      'RUSTFS_IAM_MASTER_KEY', 'RUSTFS_IAM_MASTER_KEY_OLD_KEYS']
+            if (__rustfs_desired_all[key] | default('')) != (__rustfs_deployed_env[key] | default('')) -%}
+      {%-   set ns.out = ns.out + [key] -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_cluster_keys_changed | length == 0
+    fail_msg: >-
+      {{ __rustfs_cluster_keys_changed | join(', ') }} would change on
+      {{ inventory_hostname }}, but the cluster hosts {{ __rustfs_absent_hosts }}
+      are not in this run (--limit, or a host that failed, also inside a
+      block with rescue, or is unreachable). These keys must change on every
+      node in the same run: a node with another RPC secret or layout cannot
+      talk to its peers, and nodes with different credentials or IAM master
+      keys answer differently. Nothing was changed. Run the play against the
+      whole cluster.
+    quiet: true
+  when:
+    - not rustfs_config_only | bool
+    - __rustfs_distributed | bool
+    - __rustfs_absent_hosts | length > 0
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P10: IAM master key change (README "Rotating secrets")
+# ------------------------------------------------------------------------------
+
+# RustFS encrypts IAM data with RUSTFS_IAM_MASTER_KEY, also decrypts with
+# RUSTFS_IAM_MASTER_KEY_OLD_KEYS, and rewrites what it read with an old key
+# using the current one. Two problems per host (key names only):
+#   "old key dropped": the key this node runs with (or last ran with)
+#     encrypted IAM data, but is neither the new key nor a desired old key;
+#   "new key unknown": cluster only, the running process cannot decrypt the
+#     new key yet, so a peer restarted with it would rewrite IAM data that
+#     this node then cannot read (users fail with NoSuchUser).
+- name: Check an IAM master key change against the deployed keys
+  vars:
+    __rustfs_key_deployed: "{{ __rustfs_deployed_env['RUSTFS_IAM_MASTER_KEY'] | default('') | trim }}"
+    __rustfs_key_running: "{{ __rustfs_running_env['RUSTFS_IAM_MASTER_KEY'] | default('') | trim }}"
+    __rustfs_keys_running_old: >-
+      {{ (__rustfs_running_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] | default('')).split(',') | map('trim') | select | list }}
+  ansible.builtin.set_fact:
+    __rustfs_iam_key_problem: >-
+      {{ 'old key dropped'
+         if (__rustfs_key_deployed != '' and __rustfs_key_deployed != rustfs_iam_master_key
+             and __rustfs_key_deployed not in __rustfs_iam_old_keys)
+         else ('new key unknown'
+               if (__rustfs_distributed | bool and __rustfs_running_env | length > 0
+                   and rustfs_iam_master_key != __rustfs_key_running
+                   and rustfs_iam_master_key not in __rustfs_keys_running_old)
+               else '') }}
+  when: not rustfs_config_only | bool
+  no_log: true
+  tags: always
+
+# A cluster shares its IAM data, so every host checks every cluster host that
+# passed the host guards in this run (P9 has refused when one is missing and
+# the key changes). "not checked" (the reset value of validate.yml) is only
+# possible outside the default linear strategy, and fails closed.
+- name: Validate an IAM master key change keeps IAM data readable
+  vars:
+    __rustfs_iam_nodes: >-
+      {{ ((ansible_play_hosts | intersect(rustfs_cluster_hosts) | sort) if __rustfs_distributed | bool else [inventory_hostname])
+         | map('extract', hostvars) | selectattr('__rustfs_preflight_done', 'defined')
+         | selectattr('__rustfs_preflight_done') | list }}
+    __rustfs_iam_problems: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for node in __rustfs_iam_nodes if node['__rustfs_iam_key_problem'] | default('not checked') != '' -%}
+      {%-   set ns.out = ns.out + [node['inventory_hostname'] ~ ': ' ~ node['__rustfs_iam_key_problem'] | default('not checked')] -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_iam_problems | length == 0
+    fail_msg: >-
+      Refusing the IAM master key change ({{ __rustfs_iam_problems | join('; ') }}).
+      Nothing was changed. "old key dropped": the key the node runs with must
+      stay in rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] (a
+      comma-separated list), or every IAM user, policy and service account
+      encrypted with it becomes unreadable. "new key unknown": rotate a
+      cluster in two runs, first with the current rustfs_iam_master_key and
+      the new key in RUSTFS_IAM_MASTER_KEY_OLD_KEYS, then with the two
+      swapped (README, "Rotating secrets"). "not checked": the play does not
+      use the default linear strategy.
+    quiet: true
+  when: not rustfs_config_only | bool
   tags: always

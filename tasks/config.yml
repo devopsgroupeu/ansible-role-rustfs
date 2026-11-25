@@ -43,6 +43,18 @@
   no_log: true
   tags: config
 
+# The unit is ordered after the mount unit of every data dir (preflight has
+# proven they are mount points). systemd-escape names them exactly as systemd
+# does; it only computes names and changes nothing.
+- name: Name the mount units of the data dirs
+  ansible.builtin.command:
+    argv: "{{ ['systemd-escape', '--path', '--suffix=mount'] + rustfs_data_dirs }}"
+  register: __rustfs_mount_units
+  when: rustfs_require_mounted_drives | bool
+  check_mode: false
+  changed_when: false
+  tags: config
+
 - name: Render the systemd unit
   ansible.builtin.template:
     src: rustfs.service.j2

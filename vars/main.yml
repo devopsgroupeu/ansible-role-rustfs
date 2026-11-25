@@ -58,6 +58,15 @@ __rustfs_checksum_arg: >-
 # Versioned binary the symlink points to.
 __rustfs_versioned_bin: "{{ rustfs_bin_dir }}/rustfs-{{ rustfs_version }}-{{ rustfs_libc }}"
 
+# SHA-256 of the versioned binary, written by install.yml right after it
+# installed a verified release. A versioned binary without this file, or
+# with another digest, is not trusted and is downloaded and verified again.
+__rustfs_versioned_digest_file: "{{ __rustfs_versioned_bin }}.sha256"
+
+# A pinned digest covers this version, arch and libc (vars above).
+__rustfs_checksum_pinned: >-
+  {{ ((__rustfs_checksums[rustfs_version] | default({}))[rustfs_arch ~ '-' ~ rustfs_libc] | default('')) != '' }}
+
 # Stable binary path (symlink) used by the unit.
 __rustfs_bin: "{{ rustfs_bin_dir }}/rustfs"
 
@@ -78,12 +87,6 @@ __rustfs_tls_ca_file: "{{ rustfs_tls_dir }}/ca.crt"
 
 # Generated mode only: the private CA key.
 __rustfs_tls_ca_key_file: "{{ rustfs_tls_dir }}/ca.key"
-
-# CA bundle the role's health probes (uri) trust: ca.crt while TLS is on and
-# the OS trust store is not used; "" leaves the uri default (OS store, or
-# plain HTTP). The probes always validate certificates.
-__rustfs_probe_ca_path: >-
-  {{ __rustfs_tls_ca_file if (rustfs_tls_enabled | bool and not rustfs_tls_trust_system_ca | bool) else '' }}
 
 # Generated mode only: the host that creates the private CA and hands it to
 # the other cluster hosts. A standalone node is its own cluster.
@@ -143,12 +146,15 @@ __rustfs_volume_paths: >-
   {%- endfor -%}
   {{ ns.out | unique }}
 
-# Expansion of the host part of every URL volume item, without the port.
+# Expansion of the host part of every URL volume item, without the port and
+# without the brackets of an IPv6 literal ("[fd00::1]" gives "fd00::1", the
+# form of rustfs_node_address; the probe URL adds the brackets again).
 __rustfs_volume_hosts: >-
   {%- set ns = namespace(out=[]) -%}
   {%- for vol in rustfs_volumes if vol is match('^https?://') -%}
   {%-   set part = vol | regex_replace('^https?://([^/]+).*$', '\\1')
-                       | regex_replace('^(\[[^\]]+\]|[^:]+)(:\d+)?$', '\\1') -%}
+                       | regex_replace('^(\[[^\]]+\]|[^:]+)(:\d+)?$', '\\1')
+                       | regex_replace('^\[(.*)\]$', '\\1') -%}
   {%-   set m = part | regex_search('^(.*)\{(\d+)\.\.\.(\d+)\}(.*)$', '\\1', '\\2', '\\3', '\\4') -%}
   {%-   if m -%}
   {%-     set width = (m[2] | length) if (m[1] is match('^0\d')) else 0 -%}
@@ -201,6 +207,18 @@ __rustfs_managed_keys: >-
   {{ ((__rustfs_env | list) + (__rustfs_secret_env | list)
       + ['ANSIBLE_RUSTFS_MANAGED_KEYS', 'ANSIBLE_RUSTFS_UNIT_SHA256']) | sort | join(',') }}
 
+# RUSTFS_IAM_MASTER_KEY_OLD_KEYS of the role variables, split the way
+# RustFS splits it (comma-separated, trimmed, empty entries dropped).
+__rustfs_iam_old_keys: >-
+  {{ (rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] | default('')).split(',')
+     | map('trim') | select | list }}
+
+# Attempts, 5 s apart, to wait for RustFS to hot-reload replaced TLS files:
+# one reload interval (RUSTFS_TLS_RELOAD_INTERVAL, default 30 s, at least
+# 5 s) plus 10 s.
+__rustfs_tls_reload_retries: >-
+  {{ ([rustfs_extra_env['RUSTFS_TLS_RELOAD_INTERVAL'] | default('30') | int, 5] | max) // 5 + 2 }}
+
 # Env names the role owns; refused as keys of rustfs_extra_env and
 # rustfs_extra_secret_env. RUSTFS_IAM_MASTER_KEY_OLD_KEYS stays allowed in
 # rustfs_extra_secret_env for key rotation.
@@ -231,3 +249,31 @@ __rustfs_reserved_env:
   - RUSTFS_HEALTH_ENDPOINT_ENABLE
   - RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE
   - RUST_LOG
+
+# ------------------------------------------------------------------------------
+# Deployed state, read by preflight.yml and service.yml. These values hold
+# the secrets: they are role vars, templated where they are used and never
+# stored as facts, and only no_log tasks read them.
+# ------------------------------------------------------------------------------
+
+# Environment of the running RustFS process (/proc/<MainPID>/environ, read
+# by preflight.yml), as a dict; {} when no process runs. NUL-separated
+# KEY=value entries; entries that are not a valid variable assignment are
+# skipped. Inside {{ }} the regex escape takes one backslash.
+__rustfs_running_env: >-
+  {{ dict(__rustfs_environ['content'] | default('') | b64decode
+          | regex_findall('(?:^|\x00)([A-Za-z_][A-Za-z0-9_]*)=([^\x00]*)')) }}
+
+# The env file and secrets.env on disk as one dict (slurped by
+# preflight.yml, and again by service.yml after config.yml rendered them);
+# {} for a missing file. systemd takes the last assignment of a key, and a
+# value may be quoted or not (a file the role did not write).
+__rustfs_file_env: >-
+  {{ dict(__rustfs_env_current['content'] | default('') | b64decode
+          | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)="?(.*?)"?$'))
+     | combine(dict(__rustfs_secrets_current['content'] | default('') | b64decode
+                    | regex_findall('(?m)^([A-Za-z_][A-Za-z0-9_]*)="?(.*?)"?$'))) }}
+
+# What this node runs now: the running process, or the files of the last
+# run while no process runs.
+__rustfs_deployed_env: "{{ __rustfs_running_env if __rustfs_running_env | length > 0 else __rustfs_file_env }}"

@@ -3,11 +3,12 @@
 # Variable and play-shape validation. Runs at the start of every play, in
 # render mode too (tag: always). Fail closed: nothing on the host is touched
 # before these rules pass.
-# Choice lists (rustfs_libc, rustfs_unsupported_fs_policy, rustfs_log_level,
-# rustfs_service_state) are checked by role argument validation
-# (meta/argument_specs.yml), which runs before this file; no assert repeats
-# them. Argument validation does not convert values, so the asserts below
-# also check that strings, lists and dicts really are of that type.
+# Choice lists are checked twice on purpose (house convention): by role
+# argument validation (meta/argument_specs.yml), and again below, because
+# argument validation does not run for tasks_from or with
+# rolespec_validate: false. Argument validation does not convert values, so
+# the asserts below also check that strings, lists and dicts really are of
+# that type.
 # No fail_msg echoes a secret: credential messages name the variable only.
 # Regexes: char classes instead of backslash escapes where possible. Inside
 # {{ }} (fail_msg, task vars) string constants are raw, so a backslash is
@@ -16,6 +17,21 @@
 # fail_msg and task vars are templated even when the assert passes, so they
 # must not fail on a value of the wrong type.
 # ==============================================================================
+
+# Facts the hosts read from each other (the cluster checks and the rolling
+# restart), reset first: a host whose run stops early keeps the values of an
+# earlier run of the role in the same playbook otherwise, and a rescued
+# failure keeps a host in the play.
+- name: Reset the facts the hosts compare
+  ansible.builtin.set_fact:
+    __rustfs_fingerprint: ""
+    __rustfs_formatted: false
+    __rustfs_preflight_done: false
+    __rustfs_iam_key_problem: "not checked"
+    __rustfs_restart_needed: false
+    __rustfs_restart_together: false
+    __rustfs_restart_reasons: []
+  tags: always
 
 # ------------------------------------------------------------------------------
 # Formats (rules 1 to 5)
@@ -43,6 +59,23 @@
     quiet: true
   tags: always
 
+# Duplicates the choices of meta/argument_specs.yml (see the header).
+- name: Validate the choice variables
+  ansible.builtin.assert:
+    that:
+      - rustfs_libc in ['musl', 'gnu']
+      - rustfs_unsupported_fs_policy in ['fail', 'warn']
+      - rustfs_log_level in ['trace', 'debug', 'info', 'warn', 'error']
+      - rustfs_service_state in ['started', 'stopped']
+    fail_msg: >-
+      A choice variable has a value outside its choices: rustfs_libc
+      '{{ rustfs_libc }}' (musl, gnu), rustfs_unsupported_fs_policy
+      '{{ rustfs_unsupported_fs_policy }}' (fail, warn), rustfs_log_level
+      '{{ rustfs_log_level }}' (trace, debug, info, warn, error),
+      rustfs_service_state '{{ rustfs_service_state }}' (started, stopped).
+    quiet: true
+  tags: always
+
 - name: Validate rustfs_checksum
   ansible.builtin.assert:
     that:
@@ -52,6 +85,23 @@
       64 lowercase hex characters of the release zip digest (no "sha256:"
       prefix), or leave it empty to use the pinned digest of the default
       version or the SHA256SUMS file next to the asset.
+    quiet: true
+  tags: always
+
+# Without a pinned or given digest, the zip and SHA256SUMS come from the same
+# origin: over plain HTTP a network attacker would control both.
+- name: Validate rustfs_download_base_url
+  ansible.builtin.assert:
+    that:
+      - >-
+        rustfs_download_base_url is match('^https://')
+        or rustfs_checksum != '' or __rustfs_checksum_pinned | bool
+    fail_msg: >-
+      rustfs_download_base_url '{{ rustfs_download_base_url }}' is not an
+      https:// URL, and no digest covers rustfs_version {{ rustfs_version }}
+      ({{ rustfs_arch }}-{{ rustfs_libc }}): the zip and its SHA256SUMS would
+      both come unauthenticated from that origin. Serve the mirror over
+      HTTPS, or set rustfs_checksum to the digest from the upstream release.
     quiet: true
   tags: always
 
@@ -301,34 +351,40 @@
     quiet: true
   tags: always
 
-# Upstream (crates/iam/src/keyring.rs) enforces no length or format and trims
-# whitespace, so the role requires at least 32 characters after trimming.
+# Upstream (crates/iam/src/keyring.rs) enforces no length or format, trims
+# the key and splits RUSTFS_IAM_MASTER_KEY_OLD_KEYS on commas, so a key with
+# a comma could never be listed as an old key after a rotation. Surrounding
+# whitespace is refused below with the other secrets.
 - name: Validate rustfs_iam_master_key
   ansible.builtin.assert:
     that:
       - >-
         (not (__rustfs_distributed | bool) and rustfs_iam_master_key == '')
-        or (rustfs_iam_master_key is string and rustfs_iam_master_key | trim | length >= 32)
+        or (rustfs_iam_master_key is string and rustfs_iam_master_key | length >= 32
+            and ',' not in rustfs_iam_master_key)
     fail_msg: >-
       rustfs_iam_master_key {{ 'is required in distributed mode and ' if __rustfs_distributed | bool else '' }}must
-      be at least 32 characters, not counting leading and trailing whitespace
-      (the value is not shown). It encrypts IAM data at rest
-      (RUSTFS_IAM_MASTER_KEY). Set the same random key for every node from
-      Ansible Vault (group_vars), for example the output of
-      "openssl rand -base64 48".
+      be at least 32 characters without a comma (the value is not shown). It
+      encrypts IAM data at rest (RUSTFS_IAM_MASTER_KEY), and a retired key is
+      listed in the comma-separated RUSTFS_IAM_MASTER_KEY_OLD_KEYS. Set the
+      same random key for every node from Ansible Vault (group_vars), for
+      example the output of "openssl rand -base64 48".
     quiet: true
   tags: always
 
-# Secrets are rendered as KEY="value" into secrets.env.
+# Secrets are rendered as KEY="value" into secrets.env. RustFS trims the root
+# keys, the RPC secret and the IAM master key, so a value with surrounding
+# whitespace would differ from what clients and peers use.
 - name: Validate the secret values
   vars:
+    __rustfs_role_secrets: >-
+      {{ {'rustfs_access_key': rustfs_access_key,
+          'rustfs_secret_key': rustfs_secret_key,
+          'rustfs_rpc_secret': rustfs_rpc_secret,
+          'rustfs_iam_master_key': rustfs_iam_master_key} | dict2items | selectattr('value', 'string') | list }}
     __rustfs_bad_secrets: >-
-      {{ ({'rustfs_access_key': rustfs_access_key,
-           'rustfs_secret_key': rustfs_secret_key,
-           'rustfs_rpc_secret': rustfs_rpc_secret,
-           'rustfs_iam_master_key': rustfs_iam_master_key}
-          | dict2items | selectattr('value', 'string') | selectattr('value', 'search', '["\\\n]')
-          | map(attribute='key') | list)
+      {{ (__rustfs_role_secrets | selectattr('value', 'search', '["\\\n]') | map(attribute='key') | list)
+         + (__rustfs_role_secrets | selectattr('value', 'search', '^\s|\s$') | map(attribute='key') | list)
          + ((rustfs_extra_secret_env if rustfs_extra_secret_env is mapping else {})
             | dict2items | selectattr('value', 'string') | selectattr('value', 'search', '["\\\n]')
             | map(attribute='key') | map('regex_replace', '^', 'rustfs_extra_secret_env.') | list) }}
@@ -336,10 +392,13 @@
     that:
       - __rustfs_bad_secrets | length == 0
     fail_msg: >-
-      {{ __rustfs_bad_secrets | join(', ') }}: the value contains a double
-      quote, a backslash or a newline (the value is not shown). Secrets are
-      rendered as KEY="value" into secrets.env, where these characters break
-      the file. Generate the secret without them.
+      {{ __rustfs_bad_secrets | unique | join(', ') }}: the value contains a
+      double quote, a backslash or a newline, or starts or ends with
+      whitespace (the value is not shown). Secrets are rendered as
+      KEY="value" into secrets.env, where these characters break the file,
+      and RustFS trims the root keys, the RPC secret and the IAM master key,
+      so surrounding whitespace would make the vaulted value differ from the
+      one RustFS uses. Generate the secret without them.
     quiet: true
   tags: always
 
@@ -492,12 +551,41 @@
   no_log: true
   tags: always
 
+# The next rule compares the fingerprints of the cluster hosts. With the
+# default linear strategy every host has set its fingerprint before any host
+# gets here; with strategy free or host_pinned a fast host would compare
+# itself with the hosts that got here before it, and pass.
+- name: Validate every cluster host of the play set its fingerprint
+  when: __rustfs_distributed | bool
+  vars:
+    __rustfs_lagging_hosts: >-
+      {{ (ansible_play_hosts | intersect(rustfs_cluster_hosts) | map('extract', hostvars)
+          | rejectattr('__rustfs_fingerprint', 'defined') | map(attribute='inventory_hostname') | list
+          + (ansible_play_hosts | intersect(rustfs_cluster_hosts) | map('extract', hostvars)
+             | selectattr('__rustfs_fingerprint', 'defined') | selectattr('__rustfs_fingerprint', 'equalto', '')
+             | map(attribute='inventory_hostname') | list)) | sort }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_lagging_hosts | length == 0
+    fail_msg: >-
+      The cluster hosts {{ __rustfs_lagging_hosts }} of this play have no
+      cluster fingerprint, but {{ inventory_hostname }} has one, so the
+      cluster cannot be checked for one configuration. Either they failed an
+      earlier task (a rescued failure keeps a host in the play), their
+      rustfs_volumes are not URLs, or the play does not use the default
+      linear strategy: the role compares the hosts of a play with each
+      other, so remove strategy free or host_pinned from the play and from
+      ansible.cfg.
+    quiet: true
+  tags: always
+
 # Evaluated on every host (no run_once), so every host reports a mismatch.
 - name: Validate one cluster per play
   when: __rustfs_distributed | bool
   vars:
     __rustfs_cluster_nodes: >-
-      {{ ansible_play_hosts | map('extract', hostvars) | selectattr('__rustfs_fingerprint', 'defined') | list }}
+      {{ ansible_play_hosts | map('extract', hostvars) | selectattr('__rustfs_fingerprint', 'defined')
+         | rejectattr('__rustfs_fingerprint', 'equalto', '') | list }}
   ansible.builtin.assert:
     that:
       - __rustfs_cluster_nodes | map(attribute='__rustfs_fingerprint') | unique | length == 1

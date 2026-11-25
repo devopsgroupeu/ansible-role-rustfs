@@ -3,11 +3,14 @@
 # BYO TLS: the operator places rustfs_cert.pem, rustfs_key.pem and ca.crt in
 # rustfs_tls_dir; the role never creates or copies them. Preflight P8 has
 # asserted they are in place (its stat results, __rustfs_tls_byo_stat, are
-# reused here). This file enforces owner and mode, then checks that the
-# certificate is valid now, covers rustfs_node_address and matches the key,
-# so bad material fails here, naming the address and the file, instead of
-# after a readiness timeout. It runs after config.yml: a host that fails here has
-# new files on disk, but its running process is not restarted.
+# reused here). This file enforces owner and mode, then checks what RustFS
+# checks when it loads the pair (the certificate is valid now, an extended
+# key usage includes serverAuth, the key matches) plus a SAN for
+# rustfs_node_address, so bad material fails here, naming the address and
+# the file, instead of after a restart took the node down; "rustfs tls
+# inspect" in service.yml only parses the files. It runs after config.yml: a
+# host that fails here has new files on disk, but its running process is not
+# restarted.
 # ==============================================================================
 
 # The key is readable by the service group only. ca.crt is optional with
@@ -34,7 +37,9 @@
   register: __rustfs_tls_byo_cert
   tags: tls
 
-# RustFS reloads a replaced certificate without a restart (hot reload is on).
+# RustFS reloads a replaced certificate without a restart when it keeps every
+# name of the served one; service.yml restarts the node when the reload was
+# rejected.
 - name: Validate the BYO TLS certificate is valid now
   ansible.builtin.assert:
     that:
@@ -43,7 +48,25 @@
       The certificate {{ __rustfs_tls_cert_file }} is expired or not yet valid
       (not before {{ __rustfs_tls_byo_cert['not_before'] }}, not after
       {{ __rustfs_tls_byo_cert['not_after'] }}). Place a current certificate
-      in {{ rustfs_tls_dir }}; RustFS picks it up without a restart.
+      in {{ rustfs_tls_dir }}.
+    quiet: true
+  tags: tls
+
+# RustFS refuses a server leaf whose extendedKeyUsage extension exists
+# without serverAuth (crates/tls-runtime/src/certs.rs, InvalidServerEku).
+- name: Validate the BYO TLS certificate allows server authentication
+  vars:
+    __rustfs_tls_cert_eku: "{{ __rustfs_tls_byo_cert['extended_key_usage'] | default(none) }}"
+  ansible.builtin.assert:
+    that:
+      - __rustfs_tls_cert_eku is none or 'TLS Web Server Authentication' in __rustfs_tls_cert_eku
+    fail_msg: >-
+      The certificate {{ __rustfs_tls_cert_file }} has the extended key usages
+      {{ __rustfs_tls_cert_eku }} without serverAuth ("TLS Web Server
+      Authentication"). RustFS refuses such a server certificate when it
+      loads it, after a restart has taken the node down. Issue the node
+      certificate with EKU serverAuth (and clientAuth if your PKI adds
+      usages), or without an extendedKeyUsage extension.
     quiet: true
   tags: tls
 

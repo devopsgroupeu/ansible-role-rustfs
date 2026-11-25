@@ -13,7 +13,10 @@
 # within 90 days; a node certificate is re-signed when it is missing,
 # expires within 30 days, lacks a required SAN (the CSR no longer matches)
 # or is not signed by the current CA (x509_certificate checks both). RustFS
-# hot-reloads new material, so nothing is restarted.
+# hot-reloads new material when the new certificate keeps every name of the
+# served one; when it drops a name (a SAN removed from rustfs_tls_extra_sans,
+# a changed node address) RustFS rejects the reload and service.yml restarts
+# the node instead.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -136,8 +139,10 @@
     mode: "0640"
   tags: tls
 
-# Peers and the role's probes connect to rustfs_node_address; clientAuth
-# covers the internode connections, which present the same certificate.
+# Peers and the role's probes connect to rustfs_node_address. RustFS
+# presents no client certificate on internode connections (only an
+# optional client_cert.pem, which the role does not create); clientAuth
+# keeps the certificate usable as one if an operator adds it.
 - name: Create the node CSR
   community.crypto.openssl_csr_pipe:
     privatekey_path: "{{ __rustfs_tls_key_file }}"
