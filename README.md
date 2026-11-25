@@ -1,0 +1,443 @@
+# Ansible Role - RustFS
+
+[![CI](https://github.com/devopsgroupeu/ansible-role-rustfs/actions/workflows/ci.yml/badge.svg)](https://github.com/devopsgroupeu/ansible-role-rustfs/actions/workflows/ci.yml)
+[![Ansible Galaxy](https://img.shields.io/badge/Ansible%20Galaxy-devopsgroupeu.rustfs-blue?logo=ansible)](https://galaxy.ansible.com/ui/standalone/roles/devopsgroupeu/rustfs/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![GitHub Forks](https://img.shields.io/github/forks/devopsgroupeu/ansible-role-rustfs)
+![GitHub Stars](https://img.shields.io/github/stars/devopsgroupeu/ansible-role-rustfs)
+![GitHub Issues](https://img.shields.io/github/issues/devopsgroupeu/ansible-role-rustfs)
+
+[![LinkedIn](https://img.shields.io/badge/linkedin-%230077B5.svg?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/devopsgroup8/)
+![RustFS](https://img.shields.io/badge/RustFS-0196D0?logo=rustfs&logoColor=fff&style=for-the-badge)
+
+Production-ready Ansible role for installing and configuring **RustFS**
+S3-compatible object storage (Apache-2.0) as a single node or a distributed
+erasure-coded cluster with TLS, systemd hardening and health-gated rolling
+restarts. It installs checksum-verified, versioned release binaries, refuses
+default credentials, unmounted drives and accidental layout changes, and
+restarts a cluster one node at a time without `serial`.
+
+---
+
+## Requirements
+
+- **Ansible:** 2.19 or later (`ansible-core >= 2.19, < 2.22`)
+- **Collections:** `community.crypto >= 3.2.2`
+  Install via: `ansible-galaxy collection install -r requirements.yml`
+- **Target OS:** Ubuntu 24.04 (noble), Debian 12/13 (bookworm/trixie), RHEL/Rocky/Alma 9; `x86_64` or `aarch64`; systemd
+- **RustFS version:** 1.0.6 (default; override via `rustfs_version`)
+- **On the targets:** Python 3 for Ansible. The role installs `unzip`,
+  `ca-certificates` and `python3-cryptography` on the first install; render
+  mode (`rustfs_config_only`) with BYO TLS needs `python3-cryptography`
+  already present.
+- **Egress:** HTTPS from every target to `github.com` and
+  `release-assets.githubusercontent.com`, or a mirror
+  (`rustfs_download_base_url`, see
+  [docs/INTEGRATION.md](docs/INTEGRATION.md#mirrors-and-egress))
+- **Drives:** every data dir is a mounted drive (XFS, one per physical
+  disk, in `/etc/fstab` with `nofail`); the role checks but never formats or
+  mounts
+- **Cluster:** node names resolve on every node, clocks are synchronised,
+  TCP 9000 is open between the nodes
+- **Docker (Molecule):** required for running tests locally
+- **`become: true` at the play level** - the role does not set `become` per-task
+
+---
+
+## Quick start
+
+### Install
+
+```bash
+ansible-galaxy collection install -r requirements.yml
+ansible-galaxy role install devopsgroupeu.rustfs
+```
+
+Or pin a version from Git:
+
+```yaml
+# requirements.yml
+roles:
+  - name: devopsgroupeu.rustfs
+    src: https://github.com/devopsgroupeu/ansible-role-rustfs.git
+    version: "vX.Y.Z"   # latest release tag, see GitHub Releases
+    scm: git
+```
+
+### Single node, single drive (dev/test - generated TLS)
+
+```yaml
+- name: Deploy RustFS
+  hosts: rustfs_dev
+  become: true
+  roles:
+    - role: devopsgroupeu.rustfs
+      vars:
+        rustfs_volumes:
+          - "/data/rustfs0"
+        rustfs_tls_generate_certs: true            # dev/test only
+        rustfs_require_mounted_drives: false       # dev/test only: a plain directory
+        rustfs_access_key: "{{ vault_rustfs_access_key }}"   # from Ansible Vault
+        rustfs_secret_key: "{{ vault_rustfs_secret_key }}"   # from Ansible Vault
+```
+
+A single plain path is the single-drive layout: it can never gain a pool.
+
+### Single node, multiple drives (BYO TLS)
+
+```yaml
+- name: Deploy RustFS
+  hosts: rustfs_single
+  become: true
+  roles:
+    - role: devopsgroupeu.rustfs
+      vars:
+        rustfs_volumes:
+          - "/data/rustfs{0...3}"                  # four mounted drives
+        rustfs_node_address: "{{ inventory_hostname }}"   # a SAN of the BYO certificate
+        rustfs_access_key: "{{ vault_rustfs_access_key }}"
+        rustfs_secret_key: "{{ vault_rustfs_secret_key }}"
+        rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key }}"
+```
+
+`rustfs_cert.pem`, `rustfs_key.pem` and `ca.crt` must be in `/etc/rustfs/tls`
+before the run ([BYO certificates](docs/INTEGRATION.md#byo-certificates)).
+
+### Four-node distributed cluster (BYO TLS)
+
+```yaml
+# group_vars/rustfs.yml - identical for every node
+rustfs_volumes:
+  - "https://rustfs{1...4}.example.com:9000/data/rustfs{0...3}"
+rustfs_access_key: "{{ vault_rustfs_access_key }}"
+rustfs_secret_key: "{{ vault_rustfs_secret_key }}"
+rustfs_rpc_secret: "{{ vault_rustfs_rpc_secret }}"            # required in distributed mode
+rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key }}"    # required in distributed mode
+```
+
+```yaml
+- name: Deploy RustFS cluster
+  hosts: rustfs            # exactly the four nodes, named rustfs1.example.com ... rustfs4.example.com
+  become: true
+  roles:
+    - role: devopsgroupeu.rustfs
+```
+
+The inventory names must be the host names in `rustfs_volumes`, and every
+node certificate needs its name as a DNS SAN. Run the first bootstrap
+against all nodes in one play (no `--limit`, no `serial`). Upstream
+documents a minimum of four nodes for a distributed deployment; the role
+does not assert it, because RustFS validates smaller layouts itself.
+
+See `examples/` for the complete playbooks and inventory.
+
+Check mode (`--check --diff`) is supported on hosts the role has converged
+before; it reports drift and pending restarts and changes nothing. A first
+install cannot run in check mode (the service user and the binary do not
+exist yet).
+
+---
+
+## Role variables
+
+All 44 variables are documented in full in **[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)**.
+Every variable is prefixed `rustfs_`, declared in `defaults/main.yml`, and validated
+by `meta/argument_specs.yml` (1:1 mapping).
+
+Key variables to be aware of:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `rustfs_version` | `"1.0.6"` | Pinned. A bump installs the new binary next to the old one and rolls the cluster node by node |
+| `rustfs_volumes` | `[]` | **Required.** Upstream volume expressions, one per pool (`{0...3}`, three dots). Immutable once bootstrapped |
+| `rustfs_access_key`, `rustfs_secret_key` | `""` | **Required**, from Ansible Vault. `rustfsadmin` is refused |
+| `rustfs_rpc_secret` | `""` | Required in distributed mode. A change restarts the cluster together |
+| `rustfs_iam_master_key` | `""` | Required in distributed mode, recommended everywhere. Encrypts IAM data at rest |
+| `rustfs_tls_enabled` | `true` | **TLS on by default** with BYO certificates in `rustfs_tls_dir`. Decide before the first bootstrap |
+| `rustfs_tls_generate_certs` | `false` | `true` = private CA and node certificates (dev/test only) |
+| `rustfs_require_mounted_drives` | `true` | Every data dir must be a mount point; the unit refuses to start on an unmounted drive |
+| `rustfs_allow_volumes_change` | `false` | One-run override for appending or removing a pool |
+| `rustfs_console_address` | `":9001"` | All interfaces: bind it to a management address or firewall it |
+| `rustfs_extra_env`, `rustfs_extra_secret_env` | `{}` | Any other `RUSTFS_*` setting (KMS, OIDC, OTLP, notifications) |
+| `rustfs_rolling_restart` | `true` | `false` = restart all changed nodes together |
+| `rustfs_allow_downgrade` | `false` | Set for a rollback to the previous release |
+| `rustfs_config_only` | `false` | `true` = render the files only (no install, no service) |
+
+---
+
+## Security notes
+
+### Default credentials
+
+RustFS falls back to the public credentials `rustfsadmin` / `rustfsadmin`.
+**The role refuses to render them**, and refuses empty, short or malformed
+keys, before anything is touched. Generate the access key as 20 random
+uppercase letters and digits and the secrets with `openssl rand -base64 30`,
+and keep them in Ansible Vault.
+
+### Secret storage
+
+Credentials, the RPC secret, the IAM master key and
+`rustfs_extra_secret_env` go to `/etc/rustfs/secrets.env` (`root:root 0600`)
+only. **The unit file and the env file (`/etc/default/rustfs`, readable by
+the service group, shown in `--diff`) never contain a secret.** Every task
+that touches a secret runs with `no_log: true`, and no validation message
+echoes a secret value.
+
+### IAM master key
+
+**Without `RUSTFS_IAM_MASTER_KEY` RustFS stores IAM users, policies and
+service-account secrets in plaintext on the drives**, and refuses MFA
+enrollment. `rustfs_iam_master_key` is required in distributed mode and
+recommended for single nodes. Losing the key makes the encrypted IAM data
+unreadable: store it with the other secrets and back it up.
+
+### TLS and private CAs
+
+TLS is **on by default** and covers S3, console and internode traffic with
+one certificate per node. RustFS does **not** trust the OS store for peer
+connections unless `rustfs_tls_trust_system_ca` is true; with a private CA,
+`ca.crt` in the TLS directory is the trust anchor and is required. The key
+is `root:rustfs 0640`. The role checks BYO material before it can break a
+node: validity, a SAN for `rustfs_node_address`, and that the key belongs
+to the certificate. Server mTLS (`RUSTFS_SERVER_MTLS_ENABLE`) is not
+supported: the role's health probes have no client certificate.
+
+### Generated certificates (CA key on every node)
+
+**`rustfs_tls_generate_certs: true` copies the private CA key to every
+node** (`ca.key`, `root:root 0600`), so anyone with root on one node can
+issue certificates the others trust. Use it for dev/test only; production
+uses BYO certificates from your PKI.
+
+### Console exposure
+
+The console listens on `:9001` on **all interfaces** by default and accepts
+the root credentials. Bind it to a management address
+(`rustfs_console_address: "10.0.0.11:9001"`), firewall it, or disable it
+(`rustfs_console_enabled: false`).
+
+### Binary integrity
+
+**Upstream publishes no signatures**, only `SHA256SUMS`. The role verifies
+the release zip against a SHA-256 pinned in `vars/main.yml` for its default
+version, against `rustfs_checksum`, or against `SHA256SUMS` from the same
+release, and the extracted binary must report `rustfs_version` before it is
+installed. A pinned digest fails closed if an asset is replaced upstream
+later; the other two paths trust the download source.
+
+### Root credentials are not application credentials
+
+The root keys bypass IAM policies. Create IAM users or service accounts
+with scoped policies for every application, and keep the root keys for the
+role and for emergencies
+([Post-role workflow](docs/INTEGRATION.md#post-role-workflow)).
+
+### Become
+
+The role relies on `become: true` at the play level: the service tasks, the
+daemon-reload handler and the reads of `/proc` need root.
+
+### Reading the process environment
+
+To decide restarts, the role reads `/proc/<MainPID>/environ` of the running
+RustFS process as root. That environment holds the secrets; it is read in a
+`no_log` task, compared in a `no_log` task and never stored as a fact. The
+decision facts and the "RustFS restarts" message contain key names only.
+
+---
+
+## Operations
+
+### How restarts work
+
+There is no restart handler. Every run compares each node's running binary
+and environment with the desired state and restarts only what differs:
+**one node at a time** (every peer ready before, re-admitted after) for
+ordinary changes, **all changed nodes together** for an RPC secret or a
+volume change, or when `rustfs_rolling_restart: false`. A run that died half
+way, or a `--tags config` run, is completed by the next run with exactly one
+restart. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#restart-decision-and-rolling-restart).
+
+- Run the role against the whole cluster in one play with the default
+  linear strategy. **Do not set `serial`** (refused): the role serialises
+  restarts itself.
+- `--limit <node>` is fine for day-2 work on a healthy cluster, but cannot
+  bootstrap a cluster (refused). Add or replace nodes with a full-cluster
+  run.
+- Stage tags `install`, `config`, `tls` and `service` select stages when the
+  role is applied statically (`roles:` or `import_role`); the guards are
+  tagged `always` and run with any selection.
+- A failed rollout stops the play on every host; re-running it resumes.
+
+### Upgrade
+
+Read the release notes of every version you cross, then set
+`rustfs_version` (and update `rustfs_checksum` if you pin digests yourself).
+The run downloads and verifies the new binary on every node, flips the
+symlinks (running processes keep the old binary), then restarts the nodes
+one at a time. Upstream rules: finish the upgrade on every node before any
+pool change or decommission, and never enable a "version floor" feature
+gate (see [CONFIGURATION.md](docs/CONFIGURATION.md#notes)) while versions
+are mixed.
+
+### Rollback
+
+Set `rustfs_version` back to the previous release and
+`rustfs_allow_downgrade: true` for that run. The previous binary is still
+installed, so nothing is downloaded and the nodes roll one at a time.
+Upstream documents only an immediate rollback to the previous release.
+
+### Rotating secrets
+
+- **Root credentials:** change `rustfs_access_key` / `rustfs_secret_key`
+  and run the play: a rolling restart. It is safe in a cluster because the
+  RPC secret is explicit. Update the clients that use the root keys; STS
+  sessions signed with the old secret key stop working.
+- **RPC secret:** change `rustfs_rpc_secret` and run the play. Old and new
+  secret cannot talk to each other, so the role restarts the cluster
+  together (a short outage).
+- **IAM master key:** set the new `rustfs_iam_master_key` and keep the old
+  one in `rustfs_extra_secret_env` (rolling restart):
+
+  ```yaml
+  rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key_2 }}"
+  rustfs_extra_secret_env:
+    RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ vault_rustfs_iam_master_key_1 }}"
+  ```
+
+  RustFS rewrites IAM entries with the new key lazily; keep the old key in
+  the list for as long as any entry may still use it.
+
+### Pool expansion and decommission
+
+A pool layout is immutable. Capacity grows by **appending** a pool
+expression to `rustfs_volumes` on every node (the new nodes in the same
+inventory group and play), with `rustfs_allow_volumes_change: true` for that
+run; the role restarts the changed nodes together. Existing data moves only
+with `rc admin rebalance start`. Removing a pool: decommission it with
+`rc admin decommission start`, wait for `complete`, then remove its
+expression with the same override. A single-drive deployment cannot be
+expanded. Follow the upstream runbooks for both procedures; the role only
+renders and restarts.
+
+### Drives and reboots
+
+Mount every drive through `/etc/fstab` by UUID with `nofail`. With
+`rustfs_require_mounted_drives: true` (the default) the unit carries
+`RequiresMountsFor` and `AssertPathIsMountPoint` for each data dir: after a
+reboot with a failed mount, the host boots, RustFS on that node stays down
+instead of writing to the root disk, and the rest of the cluster keeps
+serving. Replace a failed disk with an empty, identically formatted one at
+the same path; RustFS heals it.
+
+### Service user and group
+
+`rustfs_user` and `rustfs_group` are fixed after the first bootstrap:
+ownership of the data dirs is set on the mount points only, never
+recursively, so a rename would leave the object data owned by the old user.
+
+---
+
+## Tests (Molecule)
+
+```bash
+# Install test dependencies
+pip install -r requirements.txt
+ansible-galaxy collection install -r requirements.yml
+
+# Offline (no RustFS binary): render the files in many variants; variable, layout and TLS guard refusals
+molecule test -s render
+
+# Single node, four drives, generated TLS: install, start, S3 round trip, behaviour plays
+molecule test -s default
+
+# Upgrade, downgrade refusal and rollback between two releases
+molecule test -s upgrade
+
+# Four-node cluster: parallel bootstrap, rolling and together restarts, dead peer, idempotence
+molecule test -s distributed
+
+# Another distribution (debian12 is the default)
+MOLECULE_DISTRO=ubuntu2404 molecule test -s default
+```
+
+The CI pipeline (`ci.yml`) runs on every push and pull request: `yamllint`
+and `ansible-lint --profile production`; `render` and `default` on
+`debian12`, `debian13` and `ubuntu2404`; `upgrade` and `distributed` on
+`debian12`. On `default`/`debian12` it also fails when a test secret
+appears in the Molecule log, and runs a check-mode converge that must report
+`changed=0`. A single `ci-success` job aggregates the results. EL 9 is
+declared in `meta/main.yml`; test it with
+`MOLECULE_DISTRO=rockylinux9 molecule test -s default`.
+
+---
+
+## File layout
+
+```
+ansible-role-rustfs/
+|-- defaults/main.yml              # 44 public variables
+|-- vars/main.yml                  # derived values, env dicts, pinned digests (internal)
+|-- meta/main.yml                  # Galaxy metadata
+|-- meta/argument_specs.yml        # 1:1 with defaults (44 options)
+|-- handlers/main.yml              # systemd daemon-reload only (no restart handler)
+|-- tasks/
+|   |-- main.yml                   # orchestrator
+|   |-- validate.yml               # variable and play-shape guards (tag always)
+|   |-- preflight.yml              # read-only host guards (tag always)
+|   |-- install.yml                # user, checksum-verified versioned binary, symlink
+|   |-- config.yml                 # directories, secrets.env, unit, env file
+|   |-- tls.yml                    # dispatch BYO or generated TLS
+|   |-- tls_byo.yml                # BYO owner/mode, validity, SAN and key checks
+|   |-- tls_generate.yml           # dev/test CA and node certificates (community.crypto)
+|   |-- service.yml                # probe, restart decision, start, rollout, quorum gate
+|   |-- restart_node.yml           # one node: peer check, restart, wait, re-admission
+|   `-- wait_ready.yml             # one node: new main PID, then /health/ready
+|-- templates/
+|   |-- rustfs.env.j2
+|   |-- rustfs.secrets.env.j2
+|   `-- rustfs.service.j2
+|-- molecule/{render,default,upgrade,distributed}/
+|-- molecule/shared/tasks/         # helpers shared by the scenarios
+|-- examples/{single_node.yml,distributed_cluster.yml}
+|   `-- inventory/rustfs_cluster.yml
+|-- docs/{ARCHITECTURE.md,CONFIGURATION.md,INTEGRATION.md,TROUBLESHOOTING.md}
+`-- .github/workflows/{ci.yml,galaxy.yml,pre-commit.yml,release.yml,release-drafter.yml}
+```
+
+---
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+
+## Code of Conduct
+
+Read our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Changelog
+
+See the [GitHub Releases](https://github.com/devopsgroupeu/ansible-role-rustfs/releases) page for release history.
+
+## License
+
+```
+Copyright 2026 DevOpsGroup
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+---
+
+> For more information or support, please refer to the official documentation or contact us at info@devopsgroup.sk

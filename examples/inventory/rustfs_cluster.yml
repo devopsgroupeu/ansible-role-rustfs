@@ -1,0 +1,47 @@
+---
+# Example inventory for the RustFS examples.
+#
+# Group 'rustfs' is the four-node distributed cluster used by
+# examples/distributed_cluster.yml. The group name is the convention the role
+# consumes: rustfs_cluster_hosts defaults to groups['rustfs'] in distributed
+# mode, so the group must hold exactly the nodes named in rustfs_volumes.
+# The inventory names are the host names in rustfs_volumes (rustfs_node_address
+# defaults to inventory_hostname); ansible_host carries the address. Every
+# node must resolve every other node's name (DNS or /etc/hosts).
+# Cluster-wide role variables live in the group vars below, never in
+# host_vars: the role refuses a play in which they differ between nodes.
+# Secrets come from Ansible Vault (group_vars/rustfs/vault.yml next to this
+# inventory, see examples/distributed_cluster.yml).
+#
+# Group 'rustfs_single' is the single-node host of examples/single_node.yml.
+#
+# Addresses are from the documentation range 192.0.2.0/24 (RFC 5737).
+#
+# Usage:
+#   ansible-playbook -i examples/inventory/rustfs_cluster.yml examples/distributed_cluster.yml --ask-vault-pass
+
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_python_interpreter: /usr/bin/python3
+  children:
+    rustfs:
+      hosts:
+        rustfs1.example.com:
+          ansible_host: 192.0.2.11
+        rustfs2.example.com:
+          ansible_host: 192.0.2.12
+        rustfs3.example.com:
+          ansible_host: 192.0.2.13
+        rustfs4.example.com:
+          ansible_host: 192.0.2.14
+      vars:
+        # One pool: four nodes with four drives each (one erasure set of 16).
+        rustfs_volumes:
+          - "https://rustfs{1...4}.example.com:9000/data/rustfs{0...3}"
+        # Console on the management interface only.
+        rustfs_console_address: "{{ ansible_host }}:9001"
+    rustfs_single:
+      hosts:
+        s3-single.example.com:
+          ansible_host: 192.0.2.21

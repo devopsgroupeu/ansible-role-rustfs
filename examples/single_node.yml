@@ -1,0 +1,67 @@
+---
+# Single-node RustFS with four drives (SNMD) and BYO TLS certificates.
+#
+# Inventory (examples/inventory/rustfs_cluster.yml or equivalent):
+#   all:
+#     children:
+#       rustfs_single:
+#         hosts:
+#           s3-single.example.com:
+#             ansible_host: 192.0.2.21
+#
+# Pre-requisites:
+#   - Four empty disks formatted XFS and mounted at /data/rustfs0 to
+#     /data/rustfs3 through /etc/fstab (UUID, noatime,nodiratime,nofail); see
+#     docs/INTEGRATION.md "Preparing the drives". The role refuses to run
+#     while a data dir is not a mount point.
+#   - TLS material in /etc/rustfs/tls (docs/INTEGRATION.md "BYO certificates"):
+#       rustfs_cert.pem  certificate (full chain) with the SAN
+#                        DNS:s3-single.example.com and EKU serverAuth
+#       rustfs_key.pem   its private key
+#       ca.crt           the CA that signed it
+#   - s3-single.example.com resolves to the host itself (the role probes it).
+#   - Secrets in Ansible Vault, for example group_vars/rustfs_single/vault.yml
+#     next to the inventory, encrypted with ansible-vault:
+#       vault_rustfs_access_key: "<20 random A-Z0-9>"
+#       vault_rustfs_secret_key: "<openssl rand -base64 30>"
+#       vault_rustfs_iam_master_key: "<openssl rand -base64 48>"
+#
+# Usage:
+#   ansible-playbook -i examples/inventory/rustfs_cluster.yml examples/single_node.yml --ask-vault-pass
+#
+# After the run:
+#   - S3 on https://s3-single.example.com:9000, console on :9001.
+#   - Check: curl --cacert ca.crt https://s3-single.example.com:9000/health/ready
+#   - Create an admin IAM user and stop using the root keys
+#     (docs/INTEGRATION.md "Post-role workflow").
+
+- name: Deploy single-node RustFS
+  hosts: rustfs_single
+  become: true
+  gather_facts: true
+  roles:
+    - role: devopsgroupeu.rustfs
+      vars:
+        # ---- Storage --------------------------------------------------------
+        # One pool of four drives. Start with at least two drives: a single
+        # plain path (SNSD) can never gain a pool.
+        rustfs_volumes:
+          - "/data/rustfs{0...3}"
+
+        # ---- TLS (BYO, the default) -------------------------------------------
+        # rustfs_tls_enabled: true and rustfs_tls_generate_certs: false are the
+        # defaults. The role probes and checks the certificate against this
+        # name; for a wildcard listener it would default to localhost.
+        rustfs_node_address: "{{ inventory_hostname }}"
+
+        # ---- Credentials (from Ansible Vault) ----------------------------------
+        rustfs_access_key: "{{ vault_rustfs_access_key }}"
+        rustfs_secret_key: "{{ vault_rustfs_secret_key }}"
+        # Optional on a single node, but without it IAM secrets are stored in
+        # plaintext on the drives.
+        rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key }}"
+
+        # ---- Console ------------------------------------------------------------
+        # Listens on all interfaces by default; bind it to the management
+        # address.
+        rustfs_console_address: "{{ ansible_host }}:9001"

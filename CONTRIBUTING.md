@@ -109,7 +109,10 @@ When you change `rustfs_version` in `defaults/main.yml`, replace
 `__rustfs_checksums` in `vars/main.yml` with the four `linux-*` zip digests of
 the new release (`gh release download <version> -R rustfs/rustfs -p SHA256SUMS`)
 and set `__molecule_previous_version` in `molecule/upgrade/molecule.yml` to the
-release before it, in the same commit.
+release before it, in the same commit. `molecule/default/verify.yml` and the
+derived-values play of `molecule/render/verify.yml` name the default version
+literally (binary paths, health payload, pinned-digest asserts); update them
+in the same commit too.
 
 ### Variable count check
 

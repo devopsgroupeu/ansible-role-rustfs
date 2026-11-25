@@ -1,0 +1,86 @@
+---
+# Four-node distributed RustFS cluster (MNMD) with BYO TLS certificates.
+#
+# Inventory (examples/inventory/rustfs_cluster.yml or equivalent):
+#   all:
+#     children:
+#       rustfs:
+#         hosts:
+#           rustfs1.example.com:
+#             ansible_host: 192.0.2.11
+#           rustfs2.example.com:
+#             ansible_host: 192.0.2.12
+#           rustfs3.example.com:
+#             ansible_host: 192.0.2.13
+#           rustfs4.example.com:
+#             ansible_host: 192.0.2.14
+#         vars:
+#           rustfs_volumes:
+#             - "https://rustfs{1...4}.example.com:9000/data/rustfs{0...3}"
+#
+# Pre-requisites:
+#   - On every node four empty disks formatted XFS and mounted at
+#     /data/rustfs0 to /data/rustfs3 through /etc/fstab (UUID,
+#     noatime,nodiratime,nofail); see docs/INTEGRATION.md "Preparing the
+#     drives". The role refuses to run while a data dir is not a mount point.
+#   - TLS material in /etc/rustfs/tls on every node (docs/INTEGRATION.md
+#     "BYO certificates"):
+#       rustfs_cert.pem  node certificate (full chain) with the SAN
+#                        DNS:rustfsN.example.com (the node's name in
+#                        rustfs_volumes) and EKU serverAuth
+#       rustfs_key.pem   its private key
+#       ca.crt           the CA that signed every node certificate
+#   - Every node resolves every node name (DNS or identical /etc/hosts), the
+#     clocks are synchronised (chrony), and TCP 9000 is open between the nodes
+#     (S3 and internode traffic share the port). Open 9001 to operators only.
+#   - Secrets in Ansible Vault, defined once for the cluster, for example
+#     group_vars/rustfs/vault.yml next to the inventory, encrypted with
+#     ansible-vault:
+#       vault_rustfs_access_key: "<20 random A-Z0-9>"
+#       vault_rustfs_secret_key: "<openssl rand -base64 30>"
+#       vault_rustfs_rpc_secret: "<openssl rand -base64 30>"
+#       vault_rustfs_iam_master_key: "<openssl rand -base64 48>"
+#
+# Usage:
+#   ansible-playbook -i examples/inventory/rustfs_cluster.yml examples/distributed_cluster.yml --ask-vault-pass
+#   The first run must include every node (no --limit); do not add serial:
+#   the role starts all nodes together and later restarts them one at a time.
+#
+# After the run:
+#   - Every node answers https://rustfsN.example.com:9000/health/ready with
+#     "ready": true, and /minio/health/cluster with 200 (write quorum).
+#   - Put a load balancer in front (docs/INTEGRATION.md "HAProxy in front of
+#     the cluster"), create an admin IAM user and stop using the root keys
+#     (docs/INTEGRATION.md "Post-role workflow").
+#   - Later runs restart changed nodes one at a time; an RPC secret change
+#     restarts the cluster together.
+
+- name: Deploy four-node RustFS cluster
+  hosts: rustfs
+  become: true
+  gather_facts: true
+  roles:
+    - role: devopsgroupeu.rustfs
+      vars:
+        # ---- Topology -------------------------------------------------------
+        # rustfs_volumes is set in the inventory group vars. rustfs_cluster_hosts
+        # (groups['rustfs']) and rustfs_node_address (inventory_hostname) keep
+        # their defaults because the inventory names are the volume host names.
+
+        # ---- TLS (BYO, the default) -------------------------------------------
+        # rustfs_tls_enabled: true and rustfs_tls_generate_certs: false are the
+        # defaults; peers trust each other through ca.crt.
+
+        # ---- Credentials (from Ansible Vault, identical on every node) --------
+        rustfs_access_key: "{{ vault_rustfs_access_key }}"
+        rustfs_secret_key: "{{ vault_rustfs_secret_key }}"
+        # Required in distributed mode. Changing it restarts the cluster together.
+        rustfs_rpc_secret: "{{ vault_rustfs_rpc_secret }}"
+        # Required in distributed mode: RUSTFS_IAM_MASTER_KEY encrypts IAM data at
+        # rest. Changing it is a rolling restart; keep the old key in
+        # rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'].
+        rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key }}"
+
+        # ---- Service --------------------------------------------------------
+        # Rolling restarts with health gates (rustfs_rolling_restart: true) and
+        # a wait budget of 60 x 5 s per step are the defaults.
