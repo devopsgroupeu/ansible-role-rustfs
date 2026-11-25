@@ -79,6 +79,12 @@ __rustfs_tls_ca_file: "{{ rustfs_tls_dir }}/ca.crt"
 # Generated mode only: the private CA key.
 __rustfs_tls_ca_key_file: "{{ rustfs_tls_dir }}/ca.key"
 
+# CA bundle the role's health probes (uri) trust: ca.crt while TLS is on and
+# the OS trust store is not used; "" leaves the uri default (OS store, or
+# plain HTTP). The probes always validate certificates.
+__rustfs_probe_ca_path: >-
+  {{ __rustfs_tls_ca_file if (rustfs_tls_enabled | bool and not rustfs_tls_trust_system_ca | bool) else '' }}
+
 # Generated mode only: the host that creates the private CA and hands it to
 # the other cluster hosts. A standalone node is its own cluster.
 __rustfs_tls_ca_host: "{{ rustfs_cluster_hosts | first }}"

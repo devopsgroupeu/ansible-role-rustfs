@@ -882,6 +882,46 @@
           ansible.builtin.command: mv /root/cert.bak /etc/rustfs/tls/rustfs_cert.pem
           changed_when: true
 
+# Valid certificate, but a key it was not issued for (rustfs tls inspect does
+# not notice; RustFS would refuse to start after the restart).
+- name: "Negative: BYO key that does not match the certificate"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Move the BYO TLS key away
+          ansible.builtin.command: mv /etc/rustfs/tls/rustfs_key.pem /root/key.bak
+          changed_when: true
+
+        - name: Create a key the certificate was not issued for
+          community.crypto.openssl_privatekey:
+            path: /etc/rustfs/tls/rustfs_key.pem
+            type: ECC
+            curve: secp384r1
+            owner: root
+            group: rustfs
+            mode: "0640"
+
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a BYO key that does not match the certificate"
+      rescue:
+        - name: Check the refusal names the key and the mismatch
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "/etc/rustfs/tls/rustfs_key.pem does not belong to the certificate"
+            __verify_secret: ""
+      always:
+        - name: Move the BYO TLS key back
+          ansible.builtin.command: mv /root/key.bak /etc/rustfs/tls/rustfs_key.pem
+          changed_when: true
+
 # The certificate covers rustfs-render1, not node1.example.com.
 - name: "Negative: BYO certificate without the node address"
   hosts: all

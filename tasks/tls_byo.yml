@@ -4,9 +4,9 @@
 # rustfs_tls_dir; the role never creates or copies them. Preflight P8 has
 # asserted they are in place (its stat results, __rustfs_tls_byo_stat, are
 # reused here). This file enforces owner and mode, then checks that the
-# certificate is valid now and covers rustfs_node_address, so a bad
-# certificate fails here, naming the address and the file, instead of after
-# a readiness timeout. It runs after config.yml: a host that fails here has
+# certificate is valid now, covers rustfs_node_address and matches the key,
+# so bad material fails here, naming the address and the file, instead of
+# after a readiness timeout. It runs after config.yml: a host that fails here has
 # new files on disk, but its running process is not restarted.
 # ==============================================================================
 
@@ -67,5 +67,27 @@
       health probes connect to this name. Issue the certificate with that SAN
       (in a cluster: this node's host name in rustfs_volumes), or set
       rustfs_node_address to a name the certificate covers.
+    quiet: true
+  tags: tls
+
+# rustfs tls inspect (service.yml) parses both files but does not check that
+# they belong together; RustFS refuses a mismatched pair only when it starts
+# ("keys may not match"), after the restart has taken the node down. The
+# info module returns the public key only (no private key data).
+- name: Read the public key of the BYO TLS private key
+  community.crypto.openssl_privatekey_info:
+    path: "{{ __rustfs_tls_key_file }}"
+  register: __rustfs_tls_byo_key
+  tags: tls
+
+- name: Validate the BYO TLS key belongs to the certificate
+  ansible.builtin.assert:
+    that:
+      - __rustfs_tls_byo_key['public_key'] == __rustfs_tls_byo_cert['public_key']
+    fail_msg: >-
+      The private key {{ __rustfs_tls_key_file }} does not belong to the
+      certificate {{ __rustfs_tls_cert_file }} (their public keys differ).
+      RustFS refuses to start with a mismatched pair. Place the key the
+      certificate was issued for, together with the certificate.
     quiet: true
   tags: tls

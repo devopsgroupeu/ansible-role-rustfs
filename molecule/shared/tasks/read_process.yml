@@ -1,0 +1,49 @@
+---
+# Shared verify helper: reads the running RustFS process the way
+# tasks/service.yml does (main PID, /proc/<pid>/exe, /proc/<pid>/environ).
+# Fails when the unit has no main process. Outputs:
+#   __verify_proc_pid  main PID of the rustfs unit (int)
+#   __verify_proc_exe  binary the process runs (" (deleted)" appended when the
+#                      file was removed)
+#   __verify_proc_env  environment of the process as a dict (no_log: it holds
+#                      the secrets; never print it)
+
+# A read-only property query: one value, "0" while the unit is not running.
+- name: Read the main PID of the rustfs unit
+  ansible.builtin.command: systemctl show rustfs --property=MainPID --value # noqa: command-instead-of-module
+  register: __verify_proc_show
+  changed_when: false
+
+- name: Assert the rustfs unit has a main process
+  ansible.builtin.assert:
+    that:
+      - (__verify_proc_show['stdout'] | trim | int) > 0
+    fail_msg: "the rustfs unit has no main process (MainPID={{ __verify_proc_show['stdout'] | trim }})"
+    quiet: true
+
+- name: Stat the binary of the main process
+  ansible.builtin.stat:
+    path: "/proc/{{ __verify_proc_show['stdout'] | trim }}/exe"
+    follow: false
+    get_checksum: false
+  register: __verify_proc_exe_stat
+
+- name: Read the environment of the main process
+  ansible.builtin.slurp:
+    src: "/proc/{{ __verify_proc_show['stdout'] | trim }}/environ"
+  register: __verify_proc_environ
+  no_log: true
+
+- name: Collect the main PID and the binary
+  ansible.builtin.set_fact:
+    __verify_proc_pid: "{{ __verify_proc_show['stdout'] | trim | int }}"
+    __verify_proc_exe: "{{ __verify_proc_exe_stat['stat']['lnk_target'] | default('') }}"
+
+# NUL-separated KEY=value entries, parsed like tasks/service.yml does. Inside
+# {{ }} the regex escape is written with one backslash.
+- name: Decode the process environment
+  ansible.builtin.set_fact:
+    __verify_proc_env: >-
+      {{ dict(__verify_proc_environ['content'] | b64decode
+              | regex_findall('(?:^|\x00)([A-Za-z_][A-Za-z0-9_]*)=([^\x00]*)')) }}
+  no_log: true

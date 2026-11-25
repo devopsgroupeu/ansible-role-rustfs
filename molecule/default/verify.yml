@@ -1,10 +1,14 @@
 ---
-# Verify the default scenario (real install, generated TLS).
+# Verify the default scenario (real install, generated TLS, running service).
 # Play 1 checks the installed binary, the service user, the generated TLS
 # material, the rendered files and the owners and modes of spec 7.1. It
-# gathers facts, which the later plays reuse. The behaviour plays then run
-# the role with one guard tripped each and prove that the refusal left the
-# host untouched (main PID, symlink target, env file).
+# gathers facts, which the later plays reuse. Play 2 checks the running
+# service: health endpoints over HTTPS against the generated CA, the process
+# user, binary and environment, and an S3 round trip with the
+# special-character secret. The behaviour plays then re-run the role: an
+# interrupted rollout restarts exactly once, three guards refuse and leave
+# the host untouched (main PID, symlink target, env file), and the service
+# can be stopped and disabled and brought back.
 
 - name: Verify install
   hosts: all
@@ -167,8 +171,237 @@
       loop_control:
         label: "{{ item['item']['path'] }}"
 
+- name: Verify service
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    # node address of a wildcard listener; the generated certificate has a
+    # SAN for it
+    __verify_url: "https://localhost:9000"
+    __verify_console_url: "https://localhost:9001"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+    # The secret of molecule.yml as Ansible must receive it.
+    __verify_secret_key: 'molecule-secret $#''key-0123456789'
+    # argv of every signed S3 request (curl SigV4). The explicit
+    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
+    __verify_s3_curl:
+      - curl
+      - --silent
+      - --show-error
+      - --cacert
+      - "{{ __verify_ca }}"
+      - --aws-sigv4
+      - "aws:amz:us-east-1:s3"
+      - --user
+      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
+      - -H
+      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Read the running process
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Read the user of the main process
+      ansible.builtin.command:
+        argv:
+          - ps
+          - -o
+          - user=
+          - -p
+          - "{{ __verify_proc_pid }}"
+      register: __verify_ps
+      changed_when: false
+
+    - name: Probe /health/ready
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_ready
+
+    - name: Probe /health/live
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/live"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_live
+
+    - name: Probe /minio/health/cluster
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/minio/health/cluster"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_cluster
+
+    - name: Probe the console health endpoint
+      ansible.builtin.uri:
+        url: "{{ __verify_console_url }}/rustfs/console/health"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_console
+
+    - name: Write the test object payload
+      ansible.builtin.copy:
+        content: "molecule-object-payload"
+        dest: /root/molecule-object.txt
+        owner: root
+        group: root
+        mode: "0600"
+
+    # 409 when an earlier verify run created it already.
+    - name: Create the test bucket over S3
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--output', '/dev/null', '--write-out', '%{http_code}',
+                                 '-X', 'PUT', __verify_url ~ '/molecule-bucket'] }}
+      register: __verify_bucket
+      changed_when: false
+      no_log: true
+
+    - name: Upload the test object over S3
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--fail', '--upload-file', '/root/molecule-object.txt',
+                                 __verify_url ~ '/molecule-bucket/object.txt'] }}
+      changed_when: false
+      no_log: true
+
+    - name: Download the test object over S3
+      ansible.builtin.command:
+        argv: "{{ __verify_s3_curl + ['--fail', __verify_url ~ '/molecule-bucket/object.txt'] }}"
+      register: __verify_get
+      changed_when: false
+      no_log: true
+
+    - name: Request the test object without a signature
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/molecule-bucket/object.txt"
+        ca_path: "{{ __verify_ca }}"
+        status_code: 403
+      register: __verify_unsigned
+
+    - name: Assert the service and the S3 round trip
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['rustfs.service']['state'] == 'running'
+          - ansible_facts['services']['rustfs.service']['status'] == 'enabled'
+          - __verify_proc_exe == '/usr/local/bin/rustfs-1.0.6-musl'
+          - __verify_ps['stdout'] | trim == 'rustfs'
+          - __verify_ready['status'] == 200 and __verify_ready['json']['ready'] is true
+          - __verify_ready['json']['version'] == '1.0.6'
+          - __verify_live['status'] == 200
+          - __verify_cluster['status'] == 200
+          - __verify_console['status'] == 200
+          - __verify_bucket['stdout'] in ['200', '409']
+          - __verify_get['stdout'] == 'molecule-object-payload'
+          - __verify_unsigned['status'] == 403
+        fail_msg: >-
+          service check failed: unit {{ ansible_facts['services']['rustfs.service'] | default('missing') }},
+          exe {{ __verify_proc_exe }}, user {{ __verify_ps['stdout'] }},
+          ready {{ __verify_ready['json'] | default(__verify_ready['status']) }},
+          bucket HTTP {{ __verify_bucket['stdout'] }}, unsigned HTTP {{ __verify_unsigned['status'] }}
+
+    # Review Focus 2 and the IAM master key decision: the values reach the
+    # process environment byte for byte (systemd transforms nothing).
+    - name: Assert the secrets reach the process environment unchanged
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_env['RUSTFS_SECRET_KEY'] == __verify_secret_key
+          - __verify_proc_env['RUSTFS_ACCESS_KEY'] == 'MOLECULEADMIN'
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY'] == 'molecule-iam-master-key-0123456789'
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'info'
+          - __verify_proc_env['RUSTFS_VOLUMES'] == '/data/rustfs{0...3}'
+      no_log: true
+
 # ------------------------------------------------------------------------------
-# Behaviour plays: each records the host state, runs the role inside
+# Behaviour plays
+# ------------------------------------------------------------------------------
+
+# Review Focus 1 (spec 10.1 play 1): a --tags config style run (here
+# rustfs_config_only) renders a change without touching the service; the
+# next normal run must restart exactly once, in the rolling path, and the
+# run after that must not restart again.
+- name: "Behaviour: interrupted rollout restarts once"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Render a changed log level without managing the service
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_config_only: true
+        rustfs_log_level: "warn"
+
+    - name: Record the host state after rendering
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the render-only run touched no process
+      ansible.builtin.assert:
+        that:
+          - __verify_state['main_pid'] | int == __verify_state_before['main_pid'] | int
+          - __verify_state['main_pid'] | int > 0
+          - __verify_state['env_checksum'] != __verify_state_before['env_checksum']
+        fail_msg: "host state before {{ __verify_state_before }}, after rendering {{ __verify_state }}"
+
+    - name: Keep the state after rendering
+      ansible.builtin.set_fact:
+        __verify_state_rendered: "{{ __verify_state }}"
+
+    - name: Run the role with the same log level
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+
+    - name: Read the running process after the run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the run restarted once in the rolling path with the new level
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_pid | int != __verify_state_rendered['main_pid'] | int
+          - __rustfs_restart_needed
+          - not __rustfs_restart_together
+          - __rustfs_restart_reasons == ['RUSTFS_OBS_LOGGER_LEVEL']
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'warn'
+        fail_msg: >-
+          main PID {{ __verify_state_rendered['main_pid'] }} -> {{ __verify_proc_pid }},
+          restart needed {{ __rustfs_restart_needed | default('unset') }},
+          together {{ __rustfs_restart_together | default('unset') }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+    - name: Keep the main PID after the restart
+      ansible.builtin.set_fact:
+        __verify_pid_restarted: "{{ __verify_proc_pid }}"
+
+    - name: Run the role a third time with the same log level
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+
+    - name: Read the running process after the third run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the third run did not restart
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_pid | int == __verify_pid_restarted | int
+          - not __rustfs_restart_needed
+          - __rustfs_restart_reasons == []
+        fail_msg: >-
+          main PID {{ __verify_pid_restarted }} -> {{ __verify_proc_pid }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+# ------------------------------------------------------------------------------
+# Guard plays: each records the host state, runs the role inside
 # block / rescue with one guard tripped, checks the refusal with
 # molecule/shared/tasks/expect_failure.yml (the message names the variable
 # or path and never the secret), then proves the state is unchanged. All
@@ -340,3 +573,67 @@
         that:
           - __verify_state == __verify_state_before
         fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# rustfs_service_state and rustfs_service_enabled (spec 10.1 play 4). The
+# first run also renders the default log level again (the interrupted
+# rollout play left "warn"); the service is stopped, so nothing restarts.
+- name: "Behaviour: stopped and disabled, then back"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop and disable RustFS
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_service_state: "stopped"
+        rustfs_service_enabled: false
+
+    - name: Gather service facts of the stopped service
+      ansible.builtin.service_facts:
+
+    - name: Record the host state of the stopped service
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert RustFS is stopped and disabled
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['rustfs.service']['state'] in ['stopped', 'inactive']
+          - ansible_facts['services']['rustfs.service']['status'] == 'disabled'
+          - __verify_state['main_pid'] | int == 0
+        fail_msg: "rustfs.service is {{ ansible_facts['services']['rustfs.service'] }}, main PID {{ __verify_state['main_pid'] }}"
+
+    - name: Run the role with the default service state
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+    - name: Gather service facts of the restored service
+      ansible.builtin.service_facts:
+
+    - name: Probe /health/ready of the restored service
+      ansible.builtin.uri:
+        url: "https://localhost:9000/health/ready"
+        ca_path: /etc/rustfs/tls/ca.crt
+      register: __verify_ready_back
+
+    - name: Read the running process of the restored service
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert RustFS is running, enabled and ready again
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['services']['rustfs.service']['state'] == 'running'
+          - ansible_facts['services']['rustfs.service']['status'] == 'enabled'
+          - __verify_ready_back['status'] == 200 and __verify_ready_back['json']['ready'] is true
+          - __rustfs_state == 'inactive'
+          - not __rustfs_restart_needed
+        fail_msg: >-
+          rustfs.service is {{ ansible_facts['services']['rustfs.service'] }},
+          ready {{ __verify_ready_back['json'] | default(__verify_ready_back['status']) }},
+          probed state {{ __rustfs_state | default('unset') }}
+
+    - name: Assert the restored process runs the default log level
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'info'
+      no_log: true

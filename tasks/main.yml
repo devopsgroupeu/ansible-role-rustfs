@@ -31,3 +31,9 @@
 - name: Flush handlers before service management
   ansible.builtin.meta: flush_handlers
   when: not rustfs_config_only | bool
+
+# Start, restart (together or rolling) and enable; never in render mode.
+- name: Manage the RustFS service
+  ansible.builtin.include_tasks: service.yml
+  when: not rustfs_config_only | bool
+  tags: service
