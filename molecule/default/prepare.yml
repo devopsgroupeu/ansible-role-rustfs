@@ -1,0 +1,43 @@
+---
+# Prepare the default container before the role runs.
+# Bootstraps Python (plus curl for verify) and creates the extra sandbox path
+# of rustfs_systemd_read_write_paths. Nothing RustFS-specific: the role
+# creates the user, installs its package dependencies (python3-cryptography
+# among them) and the binary itself.
+
+- name: Prepare default container
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Detect available package manager
+      ansible.builtin.raw: command -v apt-get >/dev/null 2>&1 && echo apt || echo dnf
+      register: __verify_pkg_mgr
+      changed_when: false
+
+    - name: Bootstrap Python and test tools (Debian/Ubuntu)
+      ansible.builtin.raw: >-
+        apt-get update -qq &&
+        apt-get install -y -qq --no-install-recommends python3 python3-apt curl
+      changed_when: true
+      when: "'apt' in __verify_pkg_mgr['stdout']"
+
+    # EL images ship curl-minimal, which conflicts with the curl package and
+    # already provides /usr/bin/curl.
+    - name: Bootstrap Python and test tools (RHEL/Rocky)
+      ansible.builtin.raw: >-
+        dnf install -y python3 &&
+        { command -v curl >/dev/null 2>&1 || dnf install -y curl; }
+      changed_when: true
+      when: "'dnf' in __verify_pkg_mgr['stdout']"
+
+    - name: Gather facts after bootstrap
+      ansible.builtin.setup:
+
+    # Must exist before the role runs (preflight P4).
+    - name: Create the extra read-write path
+      ansible.builtin.file:
+        path: /var/lib/rustfs-extra
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"

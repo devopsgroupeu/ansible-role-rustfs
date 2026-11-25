@@ -1,0 +1,14 @@
+---
+# Converge for the default scenario. All scenario variables live in
+# provisioner.inventory.group_vars.rustfs of molecule.yml, so this play only
+# includes the role. Behaviour plays live in verify.yml, so idempotence and
+# check re-run only this plain converge.
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs

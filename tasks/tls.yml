@@ -4,6 +4,13 @@
 # TLS off there is no material to check (and none must be required).
 # ==============================================================================
 
+- name: Generate TLS material
+  ansible.builtin.include_tasks: tls_generate.yml
+  when:
+    - rustfs_tls_enabled | bool
+    - rustfs_tls_generate_certs | bool
+  tags: tls
+
 - name: Check and permission BYO TLS material
   ansible.builtin.include_tasks: tls_byo.yml
   when:

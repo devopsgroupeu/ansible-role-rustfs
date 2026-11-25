@@ -1,0 +1,93 @@
+---
+# Real install on one container: SNMD (one node, four drive directories)
+# with generated TLS. The role downloads the release zip, verifies it,
+# installs the versioned binary and the symlink, renders the files and
+# generates the CA and the node certificate. check runs after idempotence:
+# a check-mode converge of the converged host must not fail.
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: rustfs-default
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      callbacks_enabled: profile_tasks, timer
+      stdout_callback: default
+    ssh_connection:
+      pipelining: false
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+    group_vars:
+      rustfs:
+        # SNMD: one node, four drives.
+        rustfs_volumes:
+          - "/data/rustfs{0...3}"
+        # No BYO material in the container: generate a CA and a node certificate.
+        rustfs_tls_generate_certs: true
+        # One extra SAN, asserted in verify.
+        rustfs_tls_extra_sans:
+          - "DNS:rustfs.molecule.test"
+        # Non-default validity, asserted in verify (395 to 405 days).
+        rustfs_tls_cert_validity: "+400d"
+        # One extra writable path for the systemd sandbox (created in prepare).
+        rustfs_systemd_read_write_paths:
+          - "/var/lib/rustfs-extra"
+        # Container: data dirs are plain directories, not mount points.
+        rustfs_require_mounted_drives: false
+        # Container: the four data dirs share one device.
+        rustfs_unsafe_bypass_disk_check: true
+        # Container: the data dirs sit on the overlayfs root filesystem.
+        rustfs_unsupported_fs_policy: "warn"
+        # Test root access key (the default "" is refused).
+        rustfs_access_key: "MOLECULEADMIN"
+        # Test root secret key with a space, a dollar sign, "#" and "'": they
+        # must round-trip through secrets.env unchanged. Molecule interpolates
+        # this whole file (comments included), so the dollar sign is written
+        # doubled here; Ansible receives a single one.
+        rustfs_secret_key: "molecule-secret $$#'key-0123456789"
+        # Optional outside distributed mode; set so the scenario proves it is
+        # rendered into secrets.env.
+        rustfs_iam_master_key: "molecule-iam-master-key-0123456789"
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - check
+    - verify
+    - cleanup
+    - destroy

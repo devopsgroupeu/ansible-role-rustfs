@@ -1,0 +1,32 @@
+---
+# Shared verify helper: records what a refused run must leave untouched
+# (default paths). Output:
+#   __verify_state  {main_pid, link_target, env_checksum}
+# main_pid is "0" while the unit is not running; link_target and
+# env_checksum are "" when the path does not exist.
+
+# A read-only property query: one value, "0" while the unit is not running.
+- name: Read the main PID of the rustfs unit
+  ansible.builtin.command: systemctl show rustfs --property=MainPID --value # noqa: command-instead-of-module
+  register: __verify_state_pid
+  changed_when: false
+
+- name: Stat the rustfs symlink
+  ansible.builtin.stat:
+    path: /usr/local/bin/rustfs
+    follow: false
+    get_checksum: false
+  register: __verify_state_link
+
+- name: Stat the env file
+  ansible.builtin.stat:
+    path: /etc/default/rustfs
+    checksum_algorithm: sha256
+  register: __verify_state_env
+
+- name: Collect the host state
+  ansible.builtin.set_fact:
+    __verify_state:
+      main_pid: "{{ __verify_state_pid['stdout'] | trim }}"
+      link_target: "{{ __verify_state_link['stat']['lnk_target'] | default('') }}"
+      env_checksum: "{{ __verify_state_env['stat']['checksum'] | default('') }}"

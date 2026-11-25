@@ -13,11 +13,17 @@
   ansible.builtin.include_tasks: preflight.yml
   tags: always
 
+# Render mode installs nothing (no user, no binary).
+- name: Install RustFS
+  ansible.builtin.include_tasks: install.yml
+  when: not rustfs_config_only | bool
+  tags: install
+
 - name: Render configuration files and the systemd unit
   ansible.builtin.include_tasks: config.yml
   tags: config
 
-- name: Check TLS material
+- name: Generate or check TLS material
   ansible.builtin.include_tasks: tls.yml
   tags: tls
 

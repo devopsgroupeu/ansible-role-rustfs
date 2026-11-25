@@ -1,0 +1,182 @@
+---
+# ==============================================================================
+# Generated TLS (rustfs_tls_generate_certs, dev/test only): a private CA and
+# a node certificate per host, with community.crypto (no openssl shell).
+# One certificate serves S3, the console and internode traffic, so every
+# node of a cluster must trust the same CA. Steps:
+#   1. The CA host (__rustfs_tls_ca_host, the first of rustfs_cluster_hosts;
+#      a standalone node is its own CA host) creates ca.key and ca.crt.
+#   2. Every other cluster host copies both from it. The CA key therefore
+#      sits on every node, which is why this mode is dev/test only.
+#   3. Every host creates its own key and a certificate signed by the CA.
+# Regeneration is stateless: the CA certificate is renewed when it expires
+# within 90 days; a node certificate is re-signed when it is missing,
+# expires within 30 days, lacks a required SAN (the CSR no longer matches)
+# or is not signed by the current CA (x509_certificate checks both). RustFS
+# hot-reloads new material, so nothing is restarted.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Step 1: the private CA, on the CA host only
+# ------------------------------------------------------------------------------
+
+- name: Create the CA private key
+  community.crypto.openssl_privatekey:
+    path: "{{ __rustfs_tls_ca_key_file }}"
+    type: ECC
+    curve: secp384r1
+    owner: root
+    group: root
+    mode: "0600"
+  when: inventory_hostname == __rustfs_tls_ca_host
+  tags: tls
+
+- name: Create the CA CSR
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "{{ __rustfs_tls_ca_key_file }}"
+    common_name: "RustFS Role CA"
+    use_common_name_for_san: false
+    basic_constraints:
+      - "CA:TRUE"
+    basic_constraints_critical: true
+    key_usage:
+      - keyCertSign
+      - cRLSign
+      - digitalSignature
+    key_usage_critical: true
+  register: __rustfs_tls_ca_csr
+  changed_when: false
+  when: inventory_hostname == __rustfs_tls_ca_host
+  tags: tls
+
+# x509_certificate ignores timestamps when it decides whether to regenerate,
+# so an expiring CA would never be renewed on its own.
+- name: Read the existing CA certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ __rustfs_tls_ca_file }}"
+    valid_at:
+      renew: "+90d"
+  register: __rustfs_tls_ca_info
+  failed_when: false
+  changed_when: false
+  when: inventory_hostname == __rustfs_tls_ca_host
+  tags: tls
+
+# Same key on renewal, so node certificates signed by the old CA
+# certificate still verify against the new one.
+- name: Self-sign the CA certificate
+  community.crypto.x509_certificate:
+    path: "{{ __rustfs_tls_ca_file }}"
+    csr_content: "{{ __rustfs_tls_ca_csr['csr'] }}"
+    privatekey_path: "{{ __rustfs_tls_ca_key_file }}"
+    provider: selfsigned
+    selfsigned_not_before: "-1d"
+    selfsigned_not_after: "+3650d"
+    force: "{{ not (__rustfs_tls_ca_info['valid_at']['renew'] | default(false)) }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: inventory_hostname == __rustfs_tls_ca_host
+  tags: tls
+
+# ------------------------------------------------------------------------------
+# Step 2: the other cluster hosts copy the CA from the CA host
+# ------------------------------------------------------------------------------
+
+- name: Read the CA certificate from the CA host
+  ansible.builtin.slurp:
+    src: "{{ __rustfs_tls_ca_file }}"
+  register: __rustfs_tls_ca_cert_b64
+  delegate_to: "{{ __rustfs_tls_ca_host }}"
+  when: inventory_hostname != __rustfs_tls_ca_host
+  tags: tls
+
+- name: Read the CA private key from the CA host
+  ansible.builtin.slurp:
+    src: "{{ __rustfs_tls_ca_key_file }}"
+  register: __rustfs_tls_ca_key_b64
+  delegate_to: "{{ __rustfs_tls_ca_host }}"
+  when: inventory_hostname != __rustfs_tls_ca_host
+  no_log: true
+  tags: tls
+
+- name: Write the CA certificate
+  ansible.builtin.copy:
+    content: "{{ __rustfs_tls_ca_cert_b64['content'] | b64decode }}"
+    dest: "{{ __rustfs_tls_ca_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: inventory_hostname != __rustfs_tls_ca_host
+  tags: tls
+
+- name: Write the CA private key
+  ansible.builtin.copy:
+    content: "{{ __rustfs_tls_ca_key_b64['content'] | b64decode }}"
+    dest: "{{ __rustfs_tls_ca_key_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: inventory_hostname != __rustfs_tls_ca_host
+  no_log: true
+  tags: tls
+
+# ------------------------------------------------------------------------------
+# Step 3: the node key and certificate, on every host
+# ------------------------------------------------------------------------------
+
+# Readable by the service group only (spec 7.1).
+- name: Create the node private key
+  community.crypto.openssl_privatekey:
+    path: "{{ __rustfs_tls_key_file }}"
+    type: ECC
+    curve: secp384r1
+    owner: root
+    group: "{{ rustfs_group }}"
+    mode: "0640"
+  tags: tls
+
+# Peers and the role's probes connect to rustfs_node_address; clientAuth
+# covers the internode connections, which present the same certificate.
+- name: Create the node CSR
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "{{ __rustfs_tls_key_file }}"
+    common_name: "{{ rustfs_node_address }}"
+    subject_alt_name: "{{ __rustfs_tls_sans }}"
+    use_common_name_for_san: false
+    extended_key_usage:
+      - serverAuth
+      - clientAuth
+    basic_constraints:
+      - "CA:FALSE"
+  register: __rustfs_tls_node_csr
+  changed_when: false
+  tags: tls
+
+- name: Read the existing node certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ __rustfs_tls_cert_file }}"
+    valid_at:
+      renew: "+30d"
+  register: __rustfs_tls_node_info
+  failed_when: false
+  changed_when: false
+  tags: tls
+
+# Runs on every host: x509_certificate itself re-signs when the certificate
+# is missing, does not match the CSR (key or SANs) or is not signed by the
+# current CA; force adds the expiry window it does not check.
+- name: Sign the node certificate with the CA
+  community.crypto.x509_certificate:
+    path: "{{ __rustfs_tls_cert_file }}"
+    csr_content: "{{ __rustfs_tls_node_csr['csr'] }}"
+    provider: ownca
+    ownca_path: "{{ __rustfs_tls_ca_file }}"
+    ownca_privatekey_path: "{{ __rustfs_tls_ca_key_file }}"
+    ownca_not_before: "-1d"
+    ownca_not_after: "{{ rustfs_tls_cert_validity }}"
+    force: "{{ not (__rustfs_tls_node_info['valid_at']['renew'] | default(false)) }}"
+    owner: root
+    group: root
+    mode: "0644"
+  tags: tls

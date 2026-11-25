@@ -79,6 +79,17 @@ __rustfs_tls_ca_file: "{{ rustfs_tls_dir }}/ca.crt"
 # Generated mode only: the private CA key.
 __rustfs_tls_ca_key_file: "{{ rustfs_tls_dir }}/ca.key"
 
+# Generated mode only: the host that creates the private CA and hands it to
+# the other cluster hosts. A standalone node is its own cluster.
+__rustfs_tls_ca_host: "{{ rustfs_cluster_hosts | first }}"
+
+# Generated mode only: SANs of the node certificate, in this order and
+# without duplicates (localhost is the node address of a standalone node).
+__rustfs_tls_sans: >-
+  {{ ([('IP:' if __rustfs_node_is_ip | bool else 'DNS:') ~ rustfs_node_address,
+       'DNS:' ~ inventory_hostname, 'DNS:localhost', 'IP:127.0.0.1']
+      + rustfs_tls_extra_sans) | unique }}
+
 # ------------------------------------------------------------------------------
 # Topology and listener
 # ------------------------------------------------------------------------------

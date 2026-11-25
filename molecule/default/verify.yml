@@ -1,0 +1,342 @@
+---
+# Verify the default scenario (real install, generated TLS).
+# Play 1 checks the installed binary, the service user, the generated TLS
+# material, the rendered files and the owners and modes of spec 7.1. It
+# gathers facts, which the later plays reuse. The behaviour plays then run
+# the role with one guard tripped each and prove that the refusal left the
+# host untouched (main PID, symlink target, env file).
+
+- name: Verify install
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    # The secret of molecule.yml as Ansible must receive it.
+    __verify_secret_key: 'molecule-secret $#''key-0123456789'
+  tasks:
+    - name: Stat the rustfs symlink
+      ansible.builtin.stat:
+        path: /usr/local/bin/rustfs
+        follow: false
+        get_checksum: false
+      register: __verify_link
+
+    - name: Stat the versioned binary
+      ansible.builtin.stat:
+        path: /usr/local/bin/rustfs-1.0.6-musl
+        get_checksum: false
+      register: __verify_bin
+
+    - name: Run rustfs --version through the symlink
+      ansible.builtin.command: /usr/local/bin/rustfs --version
+      register: __verify_version
+      changed_when: false
+
+    - name: Read the service user
+      ansible.builtin.getent:
+        database: passwd
+        key: rustfs
+      register: __verify_user
+
+    - name: Find leftover temporary download directories
+      ansible.builtin.find:
+        paths: /usr/local/bin
+        patterns: ".rustfs-install-*"
+        file_type: any
+        hidden: true
+      register: __verify_leftovers
+
+    - name: Read the generated node certificate
+      community.crypto.x509_certificate_info:
+        path: /etc/rustfs/tls/rustfs_cert.pem
+        valid_at:
+          in_395d: "+395d"
+          in_405d: "+405d"
+      register: __verify_cert
+
+    - name: Stat the generated CA key
+      ansible.builtin.stat:
+        path: /etc/rustfs/tls/ca.key
+        get_checksum: false
+      register: __verify_ca_key
+
+    - name: Assert the install and the generated TLS material
+      ansible.builtin.assert:
+        that:
+          - __verify_link['stat']['islnk'] and __verify_link['stat']['lnk_target'] == '/usr/local/bin/rustfs-1.0.6-musl'
+          - __verify_link['stat']['pw_name'] == 'root'
+          - __verify_bin['stat']['isreg']
+          - __verify_bin['stat']['mode'] == '0755' and __verify_bin['stat']['pw_name'] == 'root'
+          - "'1.0.6' in (__verify_version['stdout'] | regex_findall('(?m)^(?:rustfs |git tag\\s*: )?(\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.]+)?)$'))"
+          - __verify_user['ansible_facts']['getent_passwd']['rustfs'][4] == '/opt/rustfs'
+          - __verify_user['ansible_facts']['getent_passwd']['rustfs'][5] == '/usr/sbin/nologin'
+          - __verify_leftovers['files'] | length == 0
+          - "'DNS:localhost' in __verify_cert['subject_alt_name']"
+          - "'IP:127.0.0.1' in __verify_cert['subject_alt_name']"
+          - "'DNS:rustfs-default' in __verify_cert['subject_alt_name']"
+          - "'DNS:rustfs.molecule.test' in __verify_cert['subject_alt_name']"
+          - __verify_cert['subject_alt_name'] | length == __verify_cert['subject_alt_name'] | unique | length
+          - "'TLS Web Server Authentication' in __verify_cert['extended_key_usage']"
+          - "'TLS Web Client Authentication' in __verify_cert['extended_key_usage']"
+          - __verify_cert['valid_at']['in_395d']
+          - not __verify_cert['valid_at']['in_405d']
+          - __verify_ca_key['stat']['mode'] == '0600'
+        fail_msg: >-
+          install or TLS check failed: link {{ __verify_link['stat']['lnk_target'] | default('missing') }},
+          version output {{ __verify_version['stdout_lines'] }},
+          leftovers {{ __verify_leftovers['files'] | map(attribute='path') | list }},
+          SANs {{ __verify_cert['subject_alt_name'] }},
+          EKU {{ __verify_cert['extended_key_usage'] | default([]) }},
+          not after {{ __verify_cert['not_after'] }}
+
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    # The binary exists here, so systemd-analyze must pass without any
+    # warning (render can only check for ignored directives).
+    - name: Assert systemd-analyze verify passes
+      ansible.builtin.assert:
+        that:
+          - __verify_analyze['rc'] == 0
+        fail_msg: "systemd-analyze verify: {{ __verify_analyze['stderr'] }}"
+
+    - name: Assert the unit and the env file
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_VOLUMES=\"/data/rustfs{0...3}\"' in __verify_env"
+          - "'RUSTFS_TLS_PATH=\"/etc/rustfs/tls\"' in __verify_env"
+          - "'RUSTFS_UNSAFE_BYPASS_DISK_CHECK=\"true\"' in __verify_env"
+          - "'RUSTFS_UNSUPPORTED_FS_POLICY=\"warn\"' in __verify_env"
+          - "'ExecStart=/usr/local/bin/rustfs server' in __verify_unit"
+          - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /var/lib/rustfs-extra' in __verify_unit"
+        fail_msg: "the unit or the env file is wrong"
+
+    # The secret must reach secrets.env byte for byte and nothing else.
+    - name: Assert the secrets stay in secrets.env
+      ansible.builtin.assert:
+        that:
+          - rustfs_secret_key == __verify_secret_key
+          - ('RUSTFS_SECRET_KEY="' ~ __verify_secret_key ~ '"') in __verify_secrets.splitlines()
+          - "'RUSTFS_ACCESS_KEY=\"MOLECULEADMIN\"' in __verify_secrets.splitlines()"
+          - "'RUSTFS_IAM_MASTER_KEY=\"molecule-iam-master-key-0123456789\"' in __verify_secrets.splitlines()"
+          - __verify_secret_key not in __verify_env
+          - "'MOLECULEADMIN' not in __verify_env"
+          - "'molecule-iam-master-key-0123456789' not in __verify_env"
+          - __verify_secret_key not in __verify_unit
+      no_log: true
+
+    - name: Stat the paths of spec 7.1
+      ansible.builtin.stat:
+        path: "{{ item['path'] }}"
+        get_checksum: false
+      loop:
+        - {path: /usr/local/bin/rustfs-1.0.6-musl, dir: false, owner: root, group: root, mode: "0755"}
+        - {path: /opt/rustfs, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /etc/rustfs, dir: true, owner: root, group: rustfs, mode: "0750"}
+        - {path: /etc/rustfs/tls, dir: true, owner: root, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs0, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs1, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs2, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /data/rustfs3, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
+        - {path: /etc/default/rustfs, dir: false, owner: root, group: rustfs, mode: "0640"}
+        - {path: /etc/rustfs/secrets.env, dir: false, owner: root, group: root, mode: "0600"}
+        - {path: /etc/systemd/system/rustfs.service, dir: false, owner: root, group: root, mode: "0644"}
+        - {path: /etc/rustfs/tls/rustfs_key.pem, dir: false, owner: root, group: rustfs, mode: "0640"}
+        - {path: /etc/rustfs/tls/rustfs_cert.pem, dir: false, owner: root, group: root, mode: "0644"}
+        - {path: /etc/rustfs/tls/ca.crt, dir: false, owner: root, group: root, mode: "0644"}
+        - {path: /etc/rustfs/tls/ca.key, dir: false, owner: root, group: root, mode: "0600"}
+      loop_control:
+        label: "{{ item['path'] }}"
+      register: __verify_paths
+
+    - name: Assert owners and modes of spec 7.1
+      ansible.builtin.assert:
+        that:
+          - item['stat']['exists']
+          - item['stat']['isdir'] == item['item']['dir']
+          - item['stat']['pw_name'] == item['item']['owner']
+          - item['stat']['gr_name'] == item['item']['group']
+          - item['stat']['mode'] == item['item']['mode']
+        fail_msg: >-
+          {{ item['item']['path'] }} is
+          {{ item['stat']['pw_name'] | default('missing') }}:{{ item['stat']['gr_name'] | default('') }}
+          {{ item['stat']['mode'] | default('') }}, expected
+          {{ item['item']['owner'] }}:{{ item['item']['group'] }} {{ item['item']['mode'] }}
+        quiet: true
+      loop: "{{ __verify_paths['results'] }}"
+      loop_control:
+        label: "{{ item['item']['path'] }}"
+
+# ------------------------------------------------------------------------------
+# Behaviour plays: each records the host state, runs the role inside
+# block / rescue with one guard tripped, checks the refusal with
+# molecule/shared/tasks/expect_failure.yml (the message names the variable
+# or path and never the secret), then proves the state is unchanged. All
+# three guards are in preflight.yml, so they refuse before install, config
+# or service.
+# ------------------------------------------------------------------------------
+
+# The data dirs are plain directories in the container (spec 10.1 play 2).
+- name: "Behaviour: mount guard refuses unmounted drives"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_require_mounted_drives: true
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted data dirs that are not mount points"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_require_mounted_drives"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+          - __verify_state['link_target'] == '/usr/local/bin/rustfs-1.0.6-musl'
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# A manual install being adopted (spec 10.1 play 3, Review Focus 5).
+- name: "Behaviour: unmanaged binary is refused"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Create the scratch binary directory
+      ansible.builtin.file:
+        path: /opt/fakebin
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Place an unmanaged rustfs binary
+      ansible.builtin.copy:
+        content: "fake"
+        dest: /opt/fakebin/rustfs
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Stat the unmanaged binary
+      ansible.builtin.stat:
+        path: /opt/fakebin/rustfs
+        follow: false
+        checksum_algorithm: sha256
+      register: __verify_fake_before
+
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_bin_dir: "/opt/fakebin"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted an unmanaged binary at the binary path"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "unmanaged"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Stat the unmanaged binary again
+      ansible.builtin.stat:
+        path: /opt/fakebin/rustfs
+        follow: false
+        checksum_algorithm: sha256
+      register: __verify_fake_after
+
+    - name: Stat the versioned binary in the scratch directory
+      ansible.builtin.stat:
+        path: /opt/fakebin/rustfs-1.0.6-musl
+        get_checksum: false
+      register: __verify_fake_versioned
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the unmanaged binary and the host are untouched
+      ansible.builtin.assert:
+        that:
+          - __verify_fake_after['stat']['isreg']
+          - __verify_fake_after['stat']['checksum'] == __verify_fake_before['stat']['checksum']
+          - not __verify_fake_versioned['stat']['exists']
+          - __verify_state == __verify_state_before
+        fail_msg: "the refused run changed the unmanaged binary or the host"
+
+    - name: Remove the scratch binary directory
+      ansible.builtin.file:
+        path: /opt/fakebin
+        state: absent
+
+# A missing ReadWritePaths entry would make the unit fail with 226/NAMESPACE.
+- name: "Behaviour: missing read-write path is refused"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_systemd_read_write_paths: ["/var/lib/rustfs-missing"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a missing read-write path"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "/var/lib/rustfs-missing"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
