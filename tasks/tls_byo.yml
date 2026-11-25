@@ -7,10 +7,12 @@
 # checks when it loads the pair (the certificate is valid now, an extended
 # key usage includes serverAuth, the key matches) plus a SAN for
 # rustfs_node_address, so bad material fails here, naming the address and
-# the file, instead of after a restart took the node down; "rustfs tls
-# inspect" in service.yml only parses the files. It runs after config.yml: a
-# host that fails here has new files on disk, but its running process is not
-# restarted.
+# the file, instead of after a restart took the node down. service.yml
+# checks the chain against ca.crt and the OS store (it also picks the store
+# of the health probes from that, so it runs in every service run), and
+# "rustfs tls inspect" there only parses the files. It runs after config.yml:
+# a host that fails here has new files on disk, but its running process is
+# not restarted, and a cluster-wide change restarts no other node either.
 # ==============================================================================
 
 # The key is readable by the service group only. ca.crt is optional with

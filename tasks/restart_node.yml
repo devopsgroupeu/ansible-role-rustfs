@@ -10,10 +10,11 @@
 # restarting node. /health/ready only says a peer can serve reads now, not
 # that the cluster survives losing this node too, and RustFS has no
 # maintenance probe. So the node goes down only when every peer is ready and
-# lists no unavailable or missing drive (details.storage): with a drive
-# already offline, taking a node down can cost an erasure set its read or
-# write quorum. After the restart every peer must list no drive again
-# (re-admission) before the next node goes down.
+# lists no unavailable or missing drive (details.storage), and no other
+# cluster host has a drive that RustFS is still healing (healing.bin): with
+# a drive already offline or not rebuilt yet, taking a node down can cost an
+# erasure set its read or write quorum. After the restart every peer must
+# list no drive again (re-admission) before the next node goes down.
 # Drive keys in messages are "<poolIndex>/<setIndex>/<diskIndex>".
 # ==============================================================================
 
@@ -127,6 +128,67 @@
           in a maintenance window.
       delegate_to: "{{ __rustfs_node }}"
       tags: service
+
+# A replaced drive leaves the drive lists as soon as RustFS has formatted
+# it, but the erasure-set heal that rebuilds its shards can take hours, and
+# /health/ready does not report it. Until the heal ends, every object it has
+# not rebuilt yet lacks that shard, so taking this node down as well can cost
+# those objects their read quorum. RustFS keeps
+# <drive>/.rustfs.sys/healing.bin while the heal rebuilds a drive. The marker
+# is looked for at every drive root of rustfs_volumes on every other cluster
+# host (__rustfs_heal_markers), hosts outside --limit included; this node's
+# own drives go down together with it and are not checked. A marker that
+# stays for the whole wait fails its item, an unreachable host has no
+# result: both are ignored here and refused by the next task.
+- name: Wait until no drive of another cluster host heals before restarting {{ __rustfs_node }}
+  ansible.builtin.stat:
+    path: "{{ item['path'] }}"
+    get_checksum: false
+  loop: "{{ hostvars[__rustfs_node]['__rustfs_heal_markers'] }}"
+  loop_control:
+    label: "{{ item['host'] }}:{{ item['path'] }}"
+  register: __rustfs_heal_marker
+  until: "'stat' not in __rustfs_heal_marker or not __rustfs_heal_marker['stat']['exists']"
+  retries: "{{ hostvars[__rustfs_node]['__rustfs_probe_retries'] }}"
+  delay: "{{ hostvars[__rustfs_node]['__rustfs_probe_delay'] }}"
+  failed_when: false
+  ignore_errors: true
+  ignore_unreachable: true
+  when: not ansible_check_mode
+  delegate_to: "{{ item['host'] }}"
+  tags: service
+
+- name: Validate no drive of another cluster host heals before restarting {{ __rustfs_node }}
+  vars:
+    __rustfs_peers_healing: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for r in __rustfs_heal_marker['results'] | default([]) if r['item'] is defined -%}
+      {%-   if r['stat'] is not defined -%}
+      {%-     set ns.out = ns.out + [r['item']['host'] ~ ' could not be checked ('
+                                     ~ (r['msg'] | default('no result') | truncate(120)) ~ ')'] -%}
+      {%-   elif r['stat']['exists'] -%}
+      {%-     set ns.out = ns.out + [r['item']['host'] ~ ' still has ' ~ r['item']['path']] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_peers_healing | length == 0
+    fail_msg: >-
+      refusing to restart {{ __rustfs_node }}: a drive of another cluster host
+      is still healing or could not be checked after
+      {{ hostvars[__rustfs_node]['__rustfs_probe_retries'] }} x {{ hostvars[__rustfs_node]['__rustfs_probe_delay'] }} s
+      ({{ __rustfs_peers_healing | join('; ') }}). RustFS rebuilds a replaced
+      drive after it stops listing it, and objects not rebuilt yet lack that
+      shard: taking another node down can cost them their read quorum.
+      Nothing was restarted on {{ __rustfs_node }} or after it. Wait until the
+      heal ends (TROUBLESHOOTING, "A drive is offline"), or set
+      rustfs_rolling_restart: false to restart all changed nodes together in
+      a maintenance window.
+    quiet: true
+  when: not ansible_check_mode
+  delegate_to: "{{ __rustfs_node }}"
+  tags: service
 
 # The symlink of a node waiting for its rolling restart was left on the old
 # binary (service.yml); switch it right before this restart.

@@ -19,8 +19,11 @@
 #     every other change.
 # A start or restart loads the files and the binary on disk, not the role
 # variables, so a run in which they differ (the config or install stage did
-# not run) refuses instead of restarting without converging. The rustfs
-# symlink is switched per node right before that node starts or restarts.
+# not run) refuses instead of restarting without converging, and a
+# cluster-wide change (the keys of preflight P9) starts or restarts no node
+# while a cluster host that passed preflight has dropped out of the run. The
+# rustfs symlink is switched per node right before that node starts or
+# restarts.
 # Waits are skipped in check mode, so a check run reports pending starts and
 # restarts without performing them.
 # ==============================================================================
@@ -71,17 +74,99 @@
   when: rustfs_tls_enabled | bool
   tags: service
 
+# RustFS trusts ca.crt and, with rustfs_tls_trust_system_ca, the OS store as
+# well (both at once). A probe trusts one file: ca_path replaces the OS
+# store. So the node certificate is checked against each store RustFS uses,
+# here, on every run before any start or restart (a --tags service run
+# too); the probes take ca.crt when it signs the certificate, else the OS
+# store. Reads public material only.
+- name: Read the node certificate for the trust check
+  ansible.builtin.slurp:
+    src: "{{ __rustfs_tls_cert_file }}"
+  register: __rustfs_trust_cert
+  failed_when: false
+  when: rustfs_tls_enabled | bool
+  tags: service
+
+# Checks issuer and signature up to a certificate of the store (validity,
+# EKU and SAN: tls_byo.yml). A store that does not sign it fails the item.
+- name: Check which trust store signs the node certificate
+  community.crypto.certificate_complete_chain:
+    input_chain: "{{ __rustfs_trust_cert['content'] | b64decode }}"
+    root_certificates:
+      - "{{ item }}"
+  loop: >-
+    {{ ([__rustfs_tls_ca_file] if (__rustfs_probe_ca_stat['stat']['exists'] | default(false)) else [])
+       + ([__rustfs_os_ca_bundle[ansible_facts['os_family']] | default(__rustfs_os_ca_bundle['Debian'])]
+          if rustfs_tls_trust_system_ca | bool else []) }}
+  loop_control:
+    label: "{{ item }}"
+  register: __rustfs_trust_chain
+  failed_when: false
+  when:
+    - rustfs_tls_enabled | bool
+    - __rustfs_trust_cert['content'] is defined
+  tags: service
+
 # Facts, because the rolling restart runs in the variable context of one
-# host and reads every node's own values through hostvars. The probes trust
-# ca.crt whenever it exists (RustFS trusts it too; rustfs_tls_trust_system_ca
-# only adds the OS store), else the OS store.
+# host and reads every node's own values through hostvars. The heal markers
+# are every drive root of rustfs_volumes on every other cluster host (none
+# for a standalone node), for the healing check of restart_node.yml.
 - name: Set the rollout settings of this node
+  vars:
+    __rustfs_trusted_by: >-
+      {{ __rustfs_trust_chain['results'] | default([]) | selectattr('root', 'defined')
+         | map(attribute='item') | list }}
   ansible.builtin.set_fact:
-    __rustfs_probe_ca: "{{ __rustfs_tls_ca_file if (__rustfs_probe_ca_stat['stat']['exists'] | default(false)) else '' }}"
+    __rustfs_probe_ca: >-
+      {{ __rustfs_tls_ca_file
+         if ((__rustfs_probe_ca_stat['stat']['exists'] | default(false))
+             and (__rustfs_tls_ca_file in __rustfs_trusted_by or __rustfs_trusted_by | length == 0))
+         else '' }}
     __rustfs_probe_retries: "{{ rustfs_ready_retries | int }}"
     __rustfs_probe_delay: "{{ rustfs_ready_delay | int }}"
     __rustfs_versioned_bin_path: "{{ __rustfs_versioned_bin }}"
     __rustfs_bin_path: "{{ __rustfs_bin }}"
+    __rustfs_heal_markers: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for peer in rustfs_cluster_hosts if peer != inventory_hostname -%}
+      {%-   for path in __rustfs_volume_paths -%}
+      {%-     set ns.out = ns.out + [{'host': peer, 'path': path ~ '/.rustfs.sys/healing.bin'}] -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  tags: service
+
+# Peers and the probes reject a certificate that no trusted store signs,
+# after the restart has taken the node down. In check mode a certificate
+# that is not on disk yet (generated mode) is not checked.
+- name: Validate the node certificate chains to a trusted CA
+  vars:
+    __rustfs_trust_stores: >-
+      {{ __rustfs_trust_chain['results'] | default([]) | map(attribute='item') | join(', ')
+         or 'none: ca.crt is missing and rustfs_tls_trust_system_ca is false' }}
+    __rustfs_trust_errors: >-
+      {{ (__rustfs_trust_chain['results'] | default([]) | rejectattr('root', 'defined')
+          | map(attribute='msg', default='') | map('truncate', 200) | join('; '))
+         if __rustfs_trust_cert['content'] is defined
+         else (__rustfs_trust_cert['msg'] | default('the certificate cannot be read')) }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_trust_cert['content'] is defined
+      - __rustfs_trust_chain['results'] | default([]) | selectattr('root', 'defined') | list | length > 0
+    fail_msg: >-
+      The certificate {{ __rustfs_tls_cert_file }} of {{ inventory_hostname }}
+      chains to none of the CA stores RustFS trusts here
+      ({{ __rustfs_trust_stores }}): {{ __rustfs_trust_errors }}.
+      The peers and the role's health probes would reject it once the node
+      restarts. Nothing was started or restarted. Put the CA that issued the
+      node certificate into ca.crt, or, for a certificate of a public CA in
+      the OS store, set rustfs_tls_trust_system_ca: true.
+    quiet: true
+  when:
+    - rustfs_tls_enabled | bool
+    - rustfs_service_state == 'started'
+    - __rustfs_trust_cert['content'] is defined or not ansible_check_mode
   tags: service
 
 # ------------------------------------------------------------------------------
@@ -280,6 +365,48 @@
     - rustfs_tls_enabled | bool
     - rustfs_service_state == 'started'
     - __rustfs_state == 'inactive' or __rustfs_restart_needed
+  tags: service
+
+# ------------------------------------------------------------------------------
+# Cluster-wide changes reach every cluster host (step 4b)
+# ------------------------------------------------------------------------------
+
+# Every host that gets here sets this. A cluster host that passed preflight
+# and then failed (install, config, tls or a check above), also inside a
+# block with rescue, has not set it in this run (validate.yml resets it).
+- name: Record that this host reached the start and restart steps
+  ansible.builtin.set_fact:
+    __rustfs_service_reached: true
+  tags: service
+
+# Preflight P9 refused these keys while a cluster host was missing; a host
+# that drops out after preflight keeps its old values just the same. Starting
+# or restarting the others with the new values would cut it off from them
+# (RPC secret, layout) or make the nodes answer differently (credentials,
+# IAM keys), so this host does not start or restart. Key names only.
+- name: Validate a cluster-wide change still reaches every cluster host
+  vars:
+    __rustfs_dropped_hosts: >-
+      {{ rustfs_cluster_hosts | difference(ansible_play_hosts | map('extract', hostvars)
+         | selectattr('__rustfs_service_reached', 'defined') | selectattr('__rustfs_service_reached')
+         | map(attribute='inventory_hostname') | list) | sort }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_dropped_hosts | length == 0
+    fail_msg: >-
+      {{ __rustfs_cluster_keys_changed | join(', ') }} change on
+      {{ inventory_hostname }}, but the cluster hosts {{ __rustfs_dropped_hosts }}
+      passed preflight and then failed in this run (also inside a block with
+      rescue), so they keep the old values. These keys must change on every
+      node together: {{ inventory_hostname }} was not started or restarted.
+      Fix the failure on those hosts, then run the play against the whole
+      cluster again.
+    quiet: true
+  when:
+    - __rustfs_distributed | bool
+    - rustfs_service_state == 'started'
+    - __rustfs_state == 'inactive' or __rustfs_restart_needed
+    - __rustfs_cluster_keys_changed | length > 0
   tags: service
 
 # ------------------------------------------------------------------------------

@@ -28,6 +28,13 @@ __rustfs_pkg_deps:
     - ca-certificates
     - python3-cryptography
 
+# The OS CA bundle that RustFS loads with rustfs_tls_trust_system_ca (the
+# first existing path of SYSTEM_CA_PATHS in rustfs/src/server/tls_material.rs
+# on that family), and that the health probes use without ca.crt.
+__rustfs_os_ca_bundle:
+  Debian: /etc/ssl/certs/ca-certificates.crt
+  RedHat: /etc/pki/tls/certs/ca-bundle.crt
+
 # ------------------------------------------------------------------------------
 # Install
 # ------------------------------------------------------------------------------

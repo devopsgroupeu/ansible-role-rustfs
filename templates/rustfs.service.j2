@@ -15,9 +15,11 @@ Before=shutdown.target
 Wants=network-online.target
 After=network-online.target
 {% if rustfs_require_mounted_drives | bool %}
-# Start after the drive mounts, but do not depend on them: a drive that is
+# Start after the drive mounts, but do not depend on them: one drive that is
 # not mounted is one offline drive for RustFS (its root-owned mount point
 # directory is not writable for the service user), not a node that is down.
+# Two or more unmounted drives of a node share the root disk, and RustFS
+# refuses to start ("distinct physical disks") until they are mounted again.
 After={{ __rustfs_mount_units['stdout_lines'] | join(' ') }}
 {% endif %}
 AssertFileIsExecutable={{ __rustfs_bin }}

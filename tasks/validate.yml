@@ -27,6 +27,8 @@
     __rustfs_fingerprint: ""
     __rustfs_formatted: false
     __rustfs_preflight_done: false
+    __rustfs_service_reached: false
+    __rustfs_cluster_keys_changed: []
     __rustfs_iam_key_problem: "not checked"
     __rustfs_restart_needed: false
     __rustfs_restart_together: false

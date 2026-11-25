@@ -321,14 +321,14 @@ argument_specs:
         default: true
         description: >
           Restart changed nodes one at a time with health gates (every peer
-          ready and every drive online). False restarts all changed nodes
-          together.
+          ready, every drive online, no drive of another node healing). False
+          restarts all changed nodes together.
 
       rustfs_ready_retries:
         type: int
         required: false
         default: 60
-        description: Attempts for every wait (new main process, readiness, peer re-admission, cluster gate).
+        description: Attempts for every wait (new main process, readiness, drives online, no drive healing, peer re-admission, cluster gate).
 
       rustfs_ready_delay:
         type: int

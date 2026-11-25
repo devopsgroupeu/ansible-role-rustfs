@@ -428,6 +428,25 @@
     __rustfs_preflight_done: true
   tags: always
 
+# The keys that must change on every node in the same run, compared with
+# what this node runs (or last ran). Key names only, never values; the
+# value comparison reads the secrets, hence no_log. service.yml checks them
+# again before any start or restart (a host can fail after preflight).
+- name: Record the cluster-wide keys this run changes
+  vars:
+    __rustfs_desired_all: "{{ __rustfs_env | combine(__rustfs_secret_env) }}"
+  ansible.builtin.set_fact:
+    __rustfs_cluster_keys_changed: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for key in ['RUSTFS_VOLUMES', 'RUSTFS_RPC_SECRET', 'RUSTFS_ACCESS_KEY', 'RUSTFS_SECRET_KEY',
+                      'RUSTFS_IAM_MASTER_KEY', 'RUSTFS_IAM_MASTER_KEY_OLD_KEYS']
+            if (__rustfs_desired_all[key] | default('')) != (__rustfs_deployed_env[key] | default('')) -%}
+      {%-   set ns.out = ns.out + [key] -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  no_log: true
+  tags: always
+
 # --limit, or a failed, rescued or unreachable host, leaves cluster hosts
 # out of the run, and they keep their old values: a node with another RPC
 # secret or layout is cut off from its peers, nodes with other root
@@ -440,15 +459,6 @@
       {{ rustfs_cluster_hosts | difference(ansible_play_hosts | map('extract', hostvars)
          | selectattr('__rustfs_preflight_done', 'defined') | selectattr('__rustfs_preflight_done')
          | map(attribute='inventory_hostname') | list) | sort }}
-    __rustfs_desired_all: "{{ __rustfs_env | combine(__rustfs_secret_env) }}"
-    __rustfs_cluster_keys_changed: >-
-      {%- set ns = namespace(out=[]) -%}
-      {%- for key in ['RUSTFS_VOLUMES', 'RUSTFS_RPC_SECRET', 'RUSTFS_ACCESS_KEY', 'RUSTFS_SECRET_KEY',
-                      'RUSTFS_IAM_MASTER_KEY', 'RUSTFS_IAM_MASTER_KEY_OLD_KEYS']
-            if (__rustfs_desired_all[key] | default('')) != (__rustfs_deployed_env[key] | default('')) -%}
-      {%-   set ns.out = ns.out + [key] -%}
-      {%- endfor -%}
-      {{ ns.out }}
   ansible.builtin.assert:
     that:
       - __rustfs_cluster_keys_changed | length == 0

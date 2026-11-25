@@ -96,7 +96,8 @@ rustfs_allow_volumes_change: false
 rustfs_unsupported_fs_policy: "fail"
 
 # Skip the check that every drive is a distinct physical disk. Test
-# environments only (containers, loop devices); never in production.
+# environments only (plain directories or loop devices on one disk; tmpfs
+# drives pass the check); never in production.
 rustfs_unsafe_bypass_disk_check: false
 
 # Inventory hosts that form this node's cluster. Distributed mode: the
@@ -219,14 +220,14 @@ rustfs_service_enabled: true
 # Desired service state: "started" or "stopped".
 rustfs_service_state: "started"
 
-# Restart changed nodes one at a time with health gates (every peer ready and
-# every drive online before a node goes down). False restarts all changed
-# nodes together (maintenance window, a node that is permanently down, or a
-# drive that stays offline).
+# Restart changed nodes one at a time with health gates (every peer ready,
+# every drive online and no drive of another node healing before a node goes
+# down). False restarts all changed nodes together (maintenance window, a
+# node that is permanently down, a drive that stays offline, a long heal).
 rustfs_rolling_restart: true
 
 # Attempts for every wait (new main process, /health/ready, drives online
-# before and after a rolling restart, cluster gate).
+# before and after a rolling restart, no drive healing, cluster gate).
 rustfs_ready_retries: 60
 
 # Seconds between attempts of every wait.
