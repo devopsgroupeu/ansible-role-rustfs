@@ -110,7 +110,8 @@ jobs:
         if: matrix.extra_checks
         run: |
           if grep -n -F -e MOLECULEADMIN -e "molecule-secret \$#'key-0123456789" \
-               -e molecule-rpc-secret-0123456789 -e molecule-iam-master-key-0123456789 molecule.log; then
+               -e molecule-rpc-secret-0123456789 -e molecule-iam-master-key-0123456789 \
+               -e molecule-iam-master-key-rotated-0123456789 molecule.log; then
             echo "A test secret appears in molecule.log; add no_log to the task that printed it"
             exit 1
           fi
@@ -130,7 +131,8 @@ jobs:
         if: matrix.extra_checks
         run: |
           if grep -n -F -e MOLECULEADMIN -e "molecule-secret \$#'key-0123456789" \
-               -e molecule-rpc-secret-0123456789 -e molecule-iam-master-key-0123456789 check.log; then
+               -e molecule-rpc-secret-0123456789 -e molecule-iam-master-key-0123456789 \
+               -e molecule-iam-master-key-rotated-0123456789 check.log; then
             echo "A test secret appears in check.log; add no_log to the task that printed it"
             exit 1
           fi
