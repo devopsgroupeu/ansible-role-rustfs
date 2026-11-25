@@ -429,20 +429,25 @@ The CI pipeline (`ci.yml`) runs on pushes and pull requests to `main` and
 `ansible-lint --profile production` on the role and on the Molecule and
 example playbooks, and the variable count and ASCII checks of
 [CONTRIBUTING.md](CONTRIBUTING.md). The `molecule` job runs `render` and
-`default` on `debian12`, `debian13` and `ubuntu2404`, and `upgrade` on
-`debian12`. On `default`/`debian12` it keeps
+`default` on `debian12`, `debian13` and `ubuntu2404`, `default` also on
+`rockylinux9`, and `upgrade` on `debian12`. On `default`/`debian12` it keeps
 the container, fails when a test secret appears in the Molecule log, and runs
 a check-mode converge (`--check --diff`) of the converged host that must
 report `changed=0` and `failed=0` and print no secret. The
 `molecule-distributed` job runs `distributed` on `debian12`. A single
 `ci-success` job aggregates the results.
 
-EL 9 is declared in `meta/main.yml` but not yet validated. On the
-`rockylinux9` image the role converges, stays idempotent and passes check
-mode and every `default` verify assert except the S3 round trip: the image's
-curl 7.76.1 cannot sign SigV4 requests that RustFS accepts
-(`SignatureDoesNotMatch`). Reproduce with
-`MOLECULE_DISTRO=rockylinux9 molecule test -s default`.
+EL 9 is tested with `default` on `rockylinux9`
+(`MOLECULE_DISTRO=rockylinux9 molecule test -s default`, in CI too):
+converge, idempotence, check mode and every verify play, among them the S3
+round trip and the probe trust plays with the EL CA bundle
+(`/etc/pki/tls/certs/ca-bundle.crt`) and `update-ca-trust`. The signed S3
+requests of the tests use `molecule/shared/files/s3_sigv4.py` (Python
+standard library, credentials on stdin) instead of `curl --aws-sigv4`,
+whose signature in the EL 9 curl 7.76.1 RustFS rejects
+(`SignatureDoesNotMatch`). `render`, `upgrade` and `distributed` do not run
+on EL 9, and SELinux is off in the container, so an enforcing EL 9 host is
+not covered.
 
 ---
 
@@ -473,6 +478,7 @@ ansible-role-rustfs/
 |   `-- rustfs.service.j2
 |-- molecule/{render,default,upgrade,distributed}/
 |-- molecule/shared/tasks/         # helpers shared by the scenarios
+|-- molecule/shared/files/         # s3_sigv4.py: signed S3 requests of the tests
 |-- examples/{single_node.yml,distributed_cluster.yml}
 |   `-- inventory/rustfs_cluster.yml
 |-- docs/{ARCHITECTURE.md,CONFIGURATION.md,INTEGRATION.md,TROUBLESHOOTING.md}
