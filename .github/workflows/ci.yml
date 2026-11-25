@@ -64,6 +64,9 @@ jobs:
       # Single-container scenarios. The four-node distributed scenario is a
       # separate job. extra_checks keeps the default/debian12 container after
       # the test for a secret grep of the log and a check-mode converge.
+      # default also runs on rockylinux9, which covers the EL 9 path (dnf
+      # dependencies, the EL CA bundle and update-ca-trust in the probe trust
+      # plays). SELinux is off in the container, so it is not covered.
       matrix:
         include:
           # render scenario - offline, no RustFS binary, guard refusals
@@ -81,6 +84,8 @@ jobs:
             distro: debian13
           - scenario: default
             distro: ubuntu2404
+          - scenario: default
+            distro: rockylinux9
           # upgrade scenario - upgrade, downgrade refusal and rollback
           - scenario: upgrade
             distro: debian12
