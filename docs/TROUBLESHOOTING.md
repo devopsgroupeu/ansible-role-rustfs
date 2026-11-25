@@ -1250,7 +1250,10 @@ directory below the mount point (root-owned, see
 lands on the root disk. A rolling restart now could cost an erasure set its
 quorum, so the role does not start one. While the drive is missing,
 `/minio/health/cluster` can also answer 503 with `pool_meta_write_blocked`
-from time to time (a pool metadata replica is unreadable).
+from time to time (a pool metadata replica is unreadable), and in a cluster
+a node that starts without one of its drives can stay in startup for
+minutes (`/health/ready` 503 with `startup_finalization_pending`); the
+other nodes keep serving.
 
 **Fix:**
 

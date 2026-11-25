@@ -657,9 +657,11 @@
         no_block: true
       when: inventory_hostname == 'rustfs-node4'
 
-    # A node lists its own missing drive; its peers keep the remote handle
-    # of a host that is online, so they list nothing. The rolling restart of
-    # any other node probes rustfs-node4 as a peer and sees the drive.
+    # rustfs-node4 lists its own missing drive; its peers list it as
+    # unavailable or not at all, depending on when they last touched it.
+    # rustfs-node4 itself can take minutes to finish its startup without the
+    # drive (503 startup_finalization_pending), so the wait does not fail:
+    # the refusal below differs by that state.
     - name: Wait until every node is ready and rustfs-node4 lists its offline drive
       ansible.builtin.uri:
         url: "{{ __verify_url }}/health/ready"
@@ -668,11 +670,31 @@
       register: __verify_degraded
       until: >-
         __verify_degraded['status'] == 200
-        and (__verify_degraded['json']['details']['storage']['unavailableDrives']
-             + __verify_degraded['json']['details']['storage']['missingDrives']) | length
-            == (1 if inventory_hostname == 'rustfs-node4' else 0)
-      retries: 30
+        and (inventory_hostname != 'rustfs-node4'
+             or (__verify_degraded['json']['details']['storage']['unavailableDrives']
+                 + __verify_degraded['json']['details']['storage']['missingDrives']) | length == 1)
+      retries: 90
       delay: 2
+      failed_when: false
+
+    - name: Assert rustfs-node4 lists its offline drive
+      ansible.builtin.assert:
+        that:
+          - >-
+            (__verify_degraded['json']['details']['storage']['unavailableDrives']
+             + __verify_degraded['json']['details']['storage']['missingDrives']) | length == 1
+        fail_msg: "rustfs-node4: {{ __verify_degraded['json'] | default(__verify_degraded['status']) }}"
+      when: inventory_hostname == 'rustfs-node4'
+
+    # A peer that is ready but reports the drive refuses at the drive gate;
+    # rustfs-node4 still starting refuses at the peer readiness check. Both
+    # stop the rollout before any node goes down.
+    - name: Pick the expected refusal of rustfs-node1
+      ansible.builtin.set_fact:
+        __verify_drive_refusal: >-
+          {{ 'refusing to restart rustfs-node1: its peers still list drives as unavailable or missing'
+             if hostvars['rustfs-node4']['__verify_degraded']['status'] == 200
+             else 'refusing to restart rustfs-node1: peer rustfs-node4 is not ready' }}
 
     - name: Record the host state
       ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
@@ -711,7 +733,7 @@
         - name: Check the refusal on the run_once host
           ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
           vars:
-            __verify_expect: "refusing to restart rustfs-node1: its peers still list drives as unavailable or missing"
+            __verify_expect: "{{ __verify_drive_refusal }}"
             __verify_secret: "{{ rustfs_secret_key }}"
           when: inventory_hostname == 'rustfs-node1'
 
@@ -753,19 +775,34 @@
       vars:
         __verify_drives: [/data/rustfs1]
 
+    - name: Read the running process before the restart
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
     - name: Restart RustFS on rustfs-node4 to see the new mount
       ansible.builtin.systemd_service:
         name: rustfs
         state: restarted
         no_block: true
 
-    - name: Wait until rustfs-node4 is ready again
+    # A read-only property query.
+    - name: Wait for the new main process of rustfs-node4
+      ansible.builtin.command: systemctl show rustfs --property=MainPID --value # noqa: command-instead-of-module
+      register: __verify_new_pid
+      until: (__verify_new_pid['stdout'] | trim | int) not in [0, __verify_proc_pid | int]
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    # The new filesystem root is still root:root, so RustFS starts without
+    # the drive (which can keep it in startup for a while); the role run
+    # below sets the owner, and its own readiness wait covers the rest.
+    - name: Wait until rustfs-node4 answers again
       ansible.builtin.uri:
         url: "{{ __verify_url }}/health/ready"
         ca_path: "{{ __verify_ca }}"
         status_code: [200, 503]
       register: __verify_restarted
-      until: __verify_restarted['status'] == 200
+      until: __verify_restarted['status'] in [200, 503]
       retries: 30
       delay: 2
 
@@ -800,7 +837,7 @@
         __verify_healed['status'] == 200
         and __verify_healed['json']['details']['storage']['unavailableDrives'] == []
         and __verify_healed['json']['details']['storage']['missingDrives'] == []
-      retries: 30
+      retries: 60
       delay: 2
 
 - name: "Behaviour: the cluster rolls again with every drive online"
