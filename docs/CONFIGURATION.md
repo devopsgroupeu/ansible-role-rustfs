@@ -28,11 +28,11 @@ variable is prefixed `rustfs_`.
 | Variable | Default | Description |
 |---|---|---|
 | `rustfs_version` | `"1.0.6"` | Pinned RustFS version, bare SemVer without a `v` prefix (the upstream tag format). Bumping it installs a new versioned binary next to the old one and rolls the cluster node by node. A lower version is refused unless `rustfs_allow_downgrade` is true. |
-| `rustfs_libc` | `"musl"` | Build flavour of the release asset. Choices: `musl` (static binary, runs everywhere), `gnu` (needs glibc >= 2.31 on the target, checked in preflight; adds profiling support). |
+| `rustfs_libc` | `"musl"` | Build flavour of the release asset. Choices: `musl` (static binary, no glibc needed; resolves host names through `/etc/hosts` and the DNS servers of `/etc/resolv.conf` only, never through NSS modules such as `myhostname`, `resolve`, `mdns` or `sss`), `gnu` (needs glibc >= 2.31 on the target, checked in preflight; resolves through NSS; adds profiling support). |
 | `rustfs_arch` | `"{{ {'x86_64': 'x86_64', 'amd64': 'x86_64', 'aarch64': 'aarch64', 'arm64': 'aarch64'}.get(ansible_facts['architecture'], '') }}"` | Arch token of the release asset, mapped from `ansible_facts['architecture']`. Any other architecture resolves to `""` and is refused (upstream ships `x86_64` and `aarch64` only). |
-| `rustfs_download_base_url` | `"https://github.com/rustfs/rustfs/releases/download"` | Download base URL. The role appends `/<version>/<asset>`, so a mirror must keep that layout, and must also serve `SHA256SUMS` there when neither a pinned digest nor `rustfs_checksum` covers the version. |
+| `rustfs_download_base_url` | `"https://github.com/rustfs/rustfs/releases/download"` | Download base URL. The role appends `/<version>/<asset>`, so a mirror must keep that layout, and must also serve `SHA256SUMS` there when neither a pinned digest nor `rustfs_checksum` covers the version. A plain `http://` URL is refused unless a pinned digest or `rustfs_checksum` covers the version. |
 | `rustfs_checksum` | `""` | Expected SHA-256 of the release zip (64 lowercase hex characters, no `sha256:` prefix). Empty: the digest pinned in `vars/main.yml` for the default version, otherwise the `SHA256SUMS` file next to the asset. Set it for air-gapped mirrors. |
-| `rustfs_bin_dir` | `"/usr/local/bin"` | Directory for the versioned binary (`rustfs-<version>-<libc>`), the `rustfs` symlink and the temporary download directory. It must exist and allow execution. |
+| `rustfs_bin_dir` | `"/usr/local/bin"` | Directory for the versioned binary (`rustfs-<version>-<libc>`) with its digest file (`rustfs-<version>-<libc>.sha256`), the `rustfs` symlink and the temporary download directory. It must exist and allow execution; it may be a symlink. |
 | `rustfs_allow_downgrade` | `false` | Allow installing a version lower than the installed one. Upstream documents only an immediate rollback to the previous release. |
 
 ---
@@ -56,7 +56,7 @@ variable is prefixed `rustfs_`.
 |---|---|---|
 | `rustfs_volumes` | `[]` | **REQUIRED.** One upstream volume expression per server pool, rendered space-joined as `RUSTFS_VOLUMES`. Identical on every node, pool order included. Ranges use three dots: `["/data/rustfs{0...3}"]` (single node, four drives) or `["https://rustfs{1...4}.example.com:9000/data/rustfs{0...3}"]` (cluster). Immutable once the cluster is bootstrapped (see `rustfs_allow_volumes_change`). |
 | `rustfs_data_dirs` | `"{{ __rustfs_volume_paths }}"` | Local drive paths on this host, derived from the path part of `rustfs_volumes`. Override per host only when pools use different paths. Each entry gets `rustfs:rustfs 0750` on the directory itself, never recursively. |
-| `rustfs_require_mounted_drives` | `true` | Refuse to continue unless every data dir is a mount point, and render `RequiresMountsFor` plus one `AssertPathIsMountPoint` per data dir into the unit, so RustFS never writes object data to the root disk, during the run or after a reboot. Set `false` only for dev/test; the role then creates the directories on whatever filesystem holds them. |
+| `rustfs_require_mounted_drives` | `true` | Refuse to continue unless every data dir is a mount point (the role sets the owner of mounted filesystem roots only), and order the unit after the mount unit of every data dir without depending on it. A drive that fails to mount at boot or disappears later is one offline drive: the node keeps serving on its other drives, and the root-owned directory below the mount point is not writable for RustFS ([INTEGRATION.md](INTEGRATION.md#preparing-the-drives)). Set `false` only for dev/test; the role then creates the directories on whatever filesystem holds them. |
 | `rustfs_allow_volumes_change` | `false` | Allow `RUSTFS_VOLUMES` or `RUSTFS_ERASURE_SET_DRIVE_COUNT` to differ from the deployed env file for one run. Only for appending a pool or removing a decommissioned one; the changed nodes are restarted together. |
 | `rustfs_unsupported_fs_policy` | `"fail"` | What RustFS does when a drive sits on NFS, CIFS, FUSE, overlayfs, 9p, Ceph, GlusterFS or GFS. Choices: `fail` (refuse to start), `warn` (log and continue). |
 | `rustfs_unsafe_bypass_disk_check` | `false` | Skip the upstream check that every local drive is a distinct physical disk. Test environments only (containers, loop devices); never in production. |
@@ -85,9 +85,9 @@ the cluster in `group_vars`, and never inline them. They are rendered into
 | Variable | Default | Description |
 |---|---|---|
 | `rustfs_access_key` | `""` | **REQUIRED.** Root access key, 3 to 128 characters of `A-Z a-z 0-9 . _ -`. The public upstream default `rustfsadmin` is refused. Recommended: 20 random uppercase letters and digits. Changing it is a rolling restart. |
-| `rustfs_secret_key` | `""` | **REQUIRED.** Root secret key, at least 8 characters, not `rustfsadmin` and not equal to the access key; no `"`, `\` or newline. Recommended: 40 or more random characters. Changing it is a rolling restart and invalidates STS sessions signed with the old key. |
-| `rustfs_rpc_secret` | `""` | Internode RPC secret. **REQUIRED in distributed mode** and identical on all nodes; at least 8 characters, not `rustfsadmin` and not equal to the secret key. An explicit secret keeps internode authentication independent of the root credentials, so those can be rotated with a rolling restart. Changing it restarts the cluster together (old and new secret cannot authenticate each other). |
-| `rustfs_iam_master_key` | `""` | IAM master key, rendered as `RUSTFS_IAM_MASTER_KEY`. It encrypts IAM users, policies and service-account secrets at rest; without it they are stored in plaintext on the drives and MFA enrollment is refused. **REQUIRED in distributed mode**, recommended everywhere; at least 32 characters (not counting surrounding whitespace). Changing it is a rolling restart; keep the old key in `rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS']` (comma-separated list) so entries written with it stay readable while RustFS rewrites them lazily. |
+| `rustfs_secret_key` | `""` | **REQUIRED.** Root secret key, at least 8 characters, not `rustfsadmin` and not equal to the access key; no `"`, `\` or newline and no leading or trailing whitespace (RustFS trims it). Recommended: 40 or more random characters. Changing it is a rolling restart and invalidates STS sessions signed with the old key. |
+| `rustfs_rpc_secret` | `""` | Internode RPC secret. **REQUIRED in distributed mode** and identical on all nodes; at least 8 characters, not `rustfsadmin`, not equal to the secret key and without surrounding whitespace. An explicit secret keeps internode authentication independent of the root credentials, so those can be rotated with a rolling restart. Changing it restarts the cluster together (old and new secret cannot authenticate each other). |
+| `rustfs_iam_master_key` | `""` | IAM master key, rendered as `RUSTFS_IAM_MASTER_KEY`. It encrypts IAM users, policies and service-account secrets at rest; without it they are stored in plaintext on the drives and MFA enrollment is refused. **REQUIRED in distributed mode**, recommended everywhere; at least 32 characters, no comma, no surrounding whitespace. A change must keep the key the nodes run with in `rustfs_extra_secret_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS']` (a comma-separated list), and a cluster rotates in two runs (preflight refuses anything else, see [README, "Rotating secrets"](../README.md#rotating-secrets)); each run is a rolling restart. |
 
 ---
 
@@ -104,9 +104,15 @@ one certificate per node. Two modes:
   a private CA on the first cluster host and a node certificate per host with
   `community.crypto`. **The CA private key is copied to every node.**
 
-RustFS reloads replaced certificate files without a restart
-(`RUSTFS_TLS_RELOAD_ENABLE` is always on), so certificate rotation never
-restarts a node.
+RustFS reloads replaced certificate files within one reload interval
+(`RUSTFS_TLS_RELOAD_ENABLE` is always on; `RUSTFS_TLS_RELOAD_INTERVAL`,
+30 s), but only when the new certificate keeps every name of the one it
+serves and no material file was removed; otherwise it keeps serving the old
+certificate. The role compares the served certificate with
+`rustfs_cert.pem` on every run and restarts the node (reason `tls`, rolling)
+when the reload did not happen within one interval, for example after a SAN
+was removed from `rustfs_tls_extra_sans` or a renewal dropped a name. A
+renewal that keeps every name restarts nothing.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -114,7 +120,7 @@ restarts a node.
 | `rustfs_tls_generate_certs` | `false` | Generate a private CA (ECC P-384, 10 years, renewed 90 days before expiry) and node certificates (SANs: `rustfs_node_address`, `inventory_hostname`, `localhost`, `127.0.0.1` and `rustfs_tls_extra_sans`; EKU serverAuth and clientAuth). Dev/test only. Requires `rustfs_tls_enabled`. |
 | `rustfs_tls_cert_validity` | `"+825d"` | Validity of generated node certificates (community.crypto relative time). A node certificate is re-signed 30 days before it expires, when its SANs or key change, or when the CA changes. |
 | `rustfs_tls_extra_sans` | `[]` | Extra SANs for generated certificates, already prefixed (`"DNS:s3.example.com"`, `"IP:10.0.0.10"`), for example a load balancer name. |
-| `rustfs_tls_trust_system_ca` | `false` | Trust the OS CA store for outbound and peer connections (`RUSTFS_TRUST_SYSTEM_CA`) and for the role's health probes. When false, `ca.crt` in `rustfs_tls_dir` is required and is the only trust anchor. |
+| `rustfs_tls_trust_system_ca` | `false` | Also trust the OS CA store for outbound and peer connections (`RUSTFS_TRUST_SYSTEM_CA`), in addition to `ca.crt` (and `public.crt`) in `rustfs_tls_dir`, which stay trusted. The role's health probes use `ca.crt` whenever it exists, else the OS store, so with both `ca.crt` must hold the CA of the node certificates. When false, `ca.crt` is required. |
 
 ---
 
@@ -142,8 +148,8 @@ restarts a node.
 |---|---|---|
 | `rustfs_service_enabled` | `true` | Enable the unit at boot. |
 | `rustfs_service_state` | `"started"` | Desired service state. Choices: `started`, `stopped`. A node that is to be stopped is never restarted. |
-| `rustfs_rolling_restart` | `true` | Restart changed nodes one at a time, each only after every peer was ready before and has re-admitted it afterwards. `false` restarts all changed nodes together (a maintenance window, or a node that is permanently down and blocks the rolling path). |
-| `rustfs_ready_retries` | `60` | Attempts for every wait: new main process, `/health/ready`, peer re-admission and the write-quorum gate. At least 1. |
+| `rustfs_rolling_restart` | `true` | Restart changed nodes one at a time, each only when every peer is ready and lists every drive online, and the next only after every peer lists every drive online again. `false` restarts all changed nodes together (a maintenance window, or a node or drive that is permanently down and blocks the rolling path). |
+| `rustfs_ready_retries` | `60` | Attempts for every wait: new main process, `/health/ready`, every drive online before and after a rolling restart, and the write-quorum gate. At least 1. |
 | `rustfs_ready_delay` | `5` | Seconds between attempts of every wait. At least 1. The default gives each wait 5 minutes. |
 | `rustfs_config_only` | `false` | Render-only mode: skip the host guards, install and service management. Used by the `render` Molecule scenario to validate templates offline. |
 
@@ -159,13 +165,15 @@ restarts a node.
   `rustfs_tls_trust_system_ca` is true, `ca.crt` are regular files (symlinks
   are followed). After the config stage, `tls_byo.yml` sets the key to
   `root:<rustfs_group> 0640` and the certificate and CA to `root:root 0644`,
-  and asserts that the certificate is valid now, that its SANs cover
-  `rustfs_node_address` (`DNS:<name>`, a one-label wildcard `DNS:*.<parent>`,
-  or `IP:<address>`; case-insensitive, no CN fallback) and that the key
-  belongs to the certificate. Right before any start or restart,
-  `rustfs tls inspect` must find a usable server certificate. A host that
-  fails a TLS check after the config stage has new files on disk, but its
-  running process is not restarted.
+  and asserts that the certificate is valid now, that an extendedKeyUsage
+  extension, when present, includes serverAuth (RustFS refuses the leaf
+  otherwise), that its SANs cover `rustfs_node_address` (`DNS:<name>`, a
+  one-label wildcard `DNS:*.<parent>`, or `IP:<address>`; case-insensitive,
+  no CN fallback) and that the key belongs to the certificate. Right before
+  any start or restart, `rustfs tls inspect` must find a usable server
+  certificate (it only parses the files). A host that fails a TLS check after
+  the config stage has new files on disk, but its running process is not
+  restarted.
 - **Volume syntax** (`rustfs_volumes`):
   - Ranges use three dots, `{0...3}`; `{0..3}` is shell syntax and refused.
   - Every list item is one server pool. With more than one item, or with URL
@@ -254,22 +262,29 @@ restarts a node.
   `TimeoutStartSec` plus `RestartSec`. RustFS bounds its own topology wait
   (180 s on unresolvable peers, then it exits and `Restart=always` starts it
   again), and the Ansible run is bounded by `rustfs_ready_retries` x
-  `rustfs_ready_delay`. Side effects: a manual `systemctl start rustfs`
-  without `--no-block` blocks until the node is ready, and boot reaches
-  `multi-user.target` only when the node is ready.
+  `rustfs_ready_delay`. Side effect: a manual `systemctl start rustfs`
+  without `--no-block` blocks until the node is ready. Boot does not wait
+  for it: the unit sets `DefaultDependencies=no` (and restores the service
+  defaults explicitly), so `multi-user.target` is not ordered after it, and
+  units such as cloud-init's final stage or
+  `systemctl is-system-running --wait` are not held up by a node that waits
+  for its peers.
 - **Data dirs without mounts.** With `rustfs_require_mounted_drives: false`
   the role creates missing data dirs, and the file module creates missing
   parents with the same owner and mode (`/data` becomes
   `rustfs:rustfs 0750` when it did not exist). With mounted drives the mount points exist,
   so no parent is created.
 - **Removing old binaries.** Every version stays installed as
-  `<rustfs_bin_dir>/rustfs-<version>-<libc>` (about 250 to 380 MB each) so
-  that a rollback is only a variable change. The role never deletes them.
-  List them and remove the ones you no longer need, but keep the one the
-  symlink points at and the previous one:
+  `<rustfs_bin_dir>/rustfs-<version>-<libc>` (about 250 to 380 MB each),
+  next to `rustfs-<version>-<libc>.sha256`, the digest the role recorded
+  when it installed the verified binary, so that a rollback is only a
+  variable change. The role never deletes them. A versioned binary without
+  its digest file, or with another digest, is downloaded and verified again.
+  List them and remove the ones you no longer need (with their digest
+  files), but keep the one the symlink points at and the previous one:
 
   ```bash
   readlink /usr/local/bin/rustfs
   ls -l /usr/local/bin/rustfs-*-*
-  rm /usr/local/bin/rustfs-1.0.4-musl   # an old version, not the current one
+  rm /usr/local/bin/rustfs-1.0.4-musl /usr/local/bin/rustfs-1.0.4-musl.sha256
   ```

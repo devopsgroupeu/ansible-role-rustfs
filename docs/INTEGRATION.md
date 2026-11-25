@@ -72,10 +72,11 @@ The consuming playbook must have the install directory on its roles path
 The role does not partition, format or mount drives; it refuses to continue
 until every data dir is a mount point (`rustfs_require_mounted_drives`).
 Prepare them in `pre_tasks`, one XFS filesystem per physical disk, mounted
-by UUID with `nofail` (a dead disk must not block the boot; the RustFS unit
-refuses to start until the drive is back). This snippet uses
-`community.general` and `ansible.posix`, which the role itself does not
-need:
+by UUID with `nofail` (a dead disk must not block the boot). The RustFS unit
+is ordered after these mounts but does not depend on them: a drive that
+does not mount is one offline drive, and the node serves on the others.
+This snippet uses `community.general` and `ansible.posix`, which the role
+itself does not need:
 
 ```yaml
 - name: Deploy RustFS
@@ -125,8 +126,23 @@ need:
 Rules from upstream: XFS (RustFS is developed and tested on it), no hardware
 RAID, no LVM or partitions that put two data dirs on one disk (RustFS
 refuses that at startup), no NFS, and never a data dir that contains another
-mount point. The role sets `rustfs:rustfs 0750` on each mount point only,
-never recursively.
+mount point. The role sets `rustfs:rustfs 0750` on each mounted filesystem
+root only, never recursively, and only after preflight has seen that every
+data dir is a mount point.
+
+The empty directory below each mount point is what RustFS sees when a
+drive is not mounted. `ansible.posix.mount` creates a missing mount point as
+`root:root 0755`; keep it that way (never `chown` it while the drive is
+unmounted). The service user has no capabilities, so it cannot write there:
+RustFS reports the drive as missing and serves on the others, and no object
+data lands on the root disk. Do not add a `file` task for the mount points
+to the snippet: on a mounted drive it would change the filesystem root the
+role owns.
+
+A filesystem mounted after RustFS started (a late mount, a replaced disk) is
+not visible to the running process: restart RustFS on that node, then run
+the play for it (it sets the owner of a new filesystem)
+([TROUBLESHOOTING.md](TROUBLESHOOTING.md#a-drive-is-offline)).
 
 ---
 
@@ -138,45 +154,60 @@ With the default `rustfs_tls_enabled: true` and
 
 | File | Content |
 |---|---|
-| `rustfs_cert.pem` | the node certificate, full chain, leaf first; SAN for `rustfs_node_address` (in a cluster: the node's host name in `rustfs_volumes`), EKU serverAuth |
+| `rustfs_cert.pem` | the node certificate, full chain, leaf first; SAN for `rustfs_node_address` (in a cluster: the node's host name in `rustfs_volumes`), EKU serverAuth (or no EKU extension) |
 | `rustfs_key.pem` | its private key |
-| `ca.crt` | the CA that signed every node certificate (not needed with `rustfs_tls_trust_system_ca: true`) |
+| `ca.crt` | the CA that signed every node certificate (not needed with `rustfs_tls_trust_system_ca: true`; with it, `ca.crt` is still trusted, and the role's probes use it when it exists) |
 
 Place them in `pre_tasks`, for example from files encrypted with
-`ansible-vault` next to the playbook. The service group does not exist
-before the first run, so copy the key as `root:root 0600`; the role then
-sets it to `root:rustfs 0640` and the certificate and CA to
-`root:root 0644`:
+`ansible-vault` next to the playbook, with the owners and modes the role
+sets (the directory and the key readable by the service group, the
+certificate and CA world-readable). Create the service group first, with
+the same name as `rustfs_group` and `system: true` as the role does: the
+pre-task then runs before the role on every run without making the key or
+the directory unreadable for the running service, and reports no change
+when the files are unchanged.
 
 ```yaml
   pre_tasks:
-    - name: Create the RustFS TLS directory
+    - name: Create the RustFS service group
+      ansible.builtin.group:
+        name: rustfs
+        system: true
+
+    - name: Create the RustFS TLS directories
       ansible.builtin.file:
-        path: /etc/rustfs/tls
+        path: "{{ item['path'] }}"
         state: directory
         owner: root
-        group: root
+        group: rustfs
         mode: "0750"
+      loop:
+        - {path: /etc/rustfs}
+        - {path: /etc/rustfs/tls}
+      loop_control:
+        label: "{{ item['path'] }}"
 
     - name: Place the node certificate, key and CA
       ansible.builtin.copy:
         src: "{{ item['src'] }}"
         dest: "/etc/rustfs/tls/{{ item['dest'] }}"
         owner: root
-        group: root
+        group: "{{ item['group'] }}"
         mode: "{{ item['mode'] }}"
       loop:
-        - {src: "files/tls/{{ inventory_hostname }}.crt", dest: rustfs_cert.pem, mode: "0644"}
-        - {src: "files/tls/{{ inventory_hostname }}.key", dest: rustfs_key.pem, mode: "0600"}
-        - {src: files/tls/ca.crt, dest: ca.crt, mode: "0644"}
+        - {src: "files/tls/{{ inventory_hostname }}.crt", dest: rustfs_cert.pem, group: root, mode: "0644"}
+        - {src: "files/tls/{{ inventory_hostname }}.key", dest: rustfs_key.pem, group: rustfs, mode: "0640"}
+        - {src: files/tls/ca.crt, dest: ca.crt, group: root, mode: "0644"}
       loop_control:
         label: "{{ item['dest'] }}"
       no_log: true
 ```
 
-RustFS reloads replaced files within 30 s, so a renewal is just this
-pre-task with new files: the role checks validity, SANs and the key match
-and restarts nothing.
+A renewal is this pre-task with new files: the role checks validity, EKU,
+SANs and the key match. RustFS reloads the files within 30 s when the new
+certificate keeps every name of the served one, and nothing restarts; when
+it drops a name, RustFS keeps the old certificate and the role restarts the
+node in the rolling order.
 
 ---
 
@@ -520,8 +551,19 @@ keep the `<base>/<version>/<asset>` layout and set
 or `<base>/<version>/SHA256SUMS` (the mirror must then serve that file too).
 `dl.rustfs.com` cannot be used as the base: it has no version directories
 and no `SHA256SUMS`. Upstream publishes no signatures, so take digests from
-the GitHub release, not from the mirror. Package dependencies (`unzip`,
-`ca-certificates`, `python3-cryptography`) come from the OS repositories.
+the GitHub release, not from the mirror. A plain `http://` mirror is
+refused unless `rustfs_checksum` (or the pinned digest) covers the version.
+The role runs the extracted binary once (`--version`) as the service user,
+before it installs it, and records the binary's SHA-256 next to it
+(`rustfs-<version>-<libc>.sha256`); a versioned binary without that file,
+or with another digest, is downloaded and verified again, so copying a
+binary into `rustfs_bin_dir` by hand does not skip the verification.
+Package dependencies (`unzip`, `ca-certificates`, `python3-cryptography`)
+come from the OS repositories.
+
+Behind an HTTP proxy, set `https_proxy` (and `no_proxy`) in the play's
+`environment:` for the download. The role's health probes go straight to
+the nodes and never use a proxy from the environment.
 
 ---
 

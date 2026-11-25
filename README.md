@@ -35,10 +35,13 @@ restarts a cluster one node at a time without `serial`.
   (`rustfs_download_base_url`, see
   [docs/INTEGRATION.md](docs/INTEGRATION.md#mirrors-and-egress))
 - **Drives:** every data dir is a mounted drive (XFS, one per physical
-  disk, in `/etc/fstab` with `nofail`); the role checks but never formats or
-  mounts
-- **Cluster:** node names resolve on every node, clocks are synchronised,
-  TCP 9000 is open between the nodes
+  disk, in `/etc/fstab` with `nofail`, on a `root:root` mount point); the
+  role checks but never formats or mounts
+- **Cluster:** node names resolve on every node, through DNS or
+  `/etc/hosts` (the default `musl` build does not use NSS modules such as
+  `nss-myhostname`, `nss-resolve` or `sssd`; use `rustfs_libc: "gnu"` where
+  names resolve only there), clocks are synchronised, TCP 9000 is open
+  between the nodes
 - **Docker (Molecule):** required for running tests locally
 - **`become: true` at the play level** - the role does not set `become` per-task
 
@@ -155,7 +158,7 @@ Key variables to be aware of:
 | `rustfs_iam_master_key` | `""` | Required in distributed mode, recommended everywhere. Encrypts IAM data at rest |
 | `rustfs_tls_enabled` | `true` | **TLS on by default** with BYO certificates in `rustfs_tls_dir`. Decide before the first bootstrap |
 | `rustfs_tls_generate_certs` | `false` | `true` = private CA and node certificates (dev/test only) |
-| `rustfs_require_mounted_drives` | `true` | Every data dir must be a mount point; the unit refuses to start on an unmounted drive |
+| `rustfs_require_mounted_drives` | `true` | Every data dir must be a mount point when the role runs; the unit waits for the mounts but a lost drive is one offline drive, not a node down |
 | `rustfs_allow_volumes_change` | `false` | One-run override for appending or removing a pool |
 | `rustfs_console_address` | `":9001"` | All interfaces: bind it to a management address or firewall it |
 | `rustfs_extra_env`, `rustfs_extra_secret_env` | `{}` | Any other `RUSTFS_*` setting (KMS, OIDC, OTLP, notifications) |
@@ -195,13 +198,15 @@ unreadable: store it with the other secrets and back it up.
 ### TLS and private CAs
 
 TLS is **on by default** and covers S3, console and internode traffic with
-one certificate per node. RustFS does **not** trust the OS store for peer
-connections unless `rustfs_tls_trust_system_ca` is true; with a private CA,
-`ca.crt` in the TLS directory is the trust anchor and is required. The key
-is `root:rustfs 0640`. The role checks BYO material before it can break a
-node: validity, a SAN for `rustfs_node_address`, and that the key belongs
-to the certificate. Server mTLS (`RUSTFS_SERVER_MTLS_ENABLE`) is not
-supported: the role's health probes have no client certificate.
+one certificate per node. RustFS trusts `ca.crt` (and `public.crt`) in the
+TLS directory; `rustfs_tls_trust_system_ca: true` adds the OS store on top.
+With a private CA, `ca.crt` is the trust anchor and is required, and the
+role's health probes use it whenever it exists. The key is
+`root:rustfs 0640`. The role checks BYO material before it can break a
+node: validity, serverAuth in an extended key usage, a SAN for
+`rustfs_node_address`, and that the key belongs to the certificate. Server
+mTLS (`RUSTFS_SERVER_MTLS_ENABLE`) is not supported: the role's health
+probes have no client certificate.
 
 ### Generated certificates (CA key on every node)
 
@@ -222,9 +227,13 @@ the root credentials. Bind it to a management address
 **Upstream publishes no signatures**, only `SHA256SUMS`. The role verifies
 the release zip against a SHA-256 pinned in `vars/main.yml` for its default
 version, against `rustfs_checksum`, or against `SHA256SUMS` from the same
-release, and the extracted binary must report `rustfs_version` before it is
-installed. A pinned digest fails closed if an asset is replaced upstream
-later; the other two paths trust the download source.
+release (HTTPS only: a plain `http://` mirror needs a pinned or given
+digest), and the extracted binary must report `rustfs_version`, run as the
+unprivileged service user, before it is installed. The role records the
+SHA-256 of every binary it installed (`rustfs-<version>-<libc>.sha256`) and
+downloads and verifies again a versioned binary that does not match it. A
+pinned digest fails closed if an asset is replaced upstream later; the
+other two paths trust the download source.
 
 ### Root credentials are not application credentials
 
@@ -240,10 +249,12 @@ daemon-reload handler and the reads of `/proc` need root.
 
 ### Reading the process environment
 
-To decide restarts, the role reads `/proc/<MainPID>/environ` of the running
-RustFS process as root. That environment holds the secrets; it is read in a
-`no_log` task, compared in a `no_log` task and never stored as a fact. The
-decision facts and the "RustFS restarts" message contain key names only.
+To decide restarts, and to guard layout, cluster-wide and IAM master key
+changes, the role reads `/proc/<MainPID>/environ` of the running RustFS
+process and the deployed `secrets.env` as root. They hold the secrets; they
+are read in `no_log` tasks and never stored as facts (role variables
+template them where they are compared). The decision facts, the guard
+messages and the "RustFS restarts" message contain key names only.
 
 ---
 
@@ -251,35 +262,45 @@ decision facts and the "RustFS restarts" message contain key names only.
 
 ### How restarts work
 
-There is no restart handler. Every run compares each node's running binary
-and environment with the desired state and restarts only what differs:
-**one node at a time** (every peer ready before, re-admitted after) for
-ordinary changes, **all changed nodes together** for an RPC secret or a
-volume change, or when `rustfs_rolling_restart: false`. A run that died half
-way, or a `--tags config` run, is completed by the next run with exactly one
+There is no restart handler. Every run compares each node's running binary,
+environment and served certificate with the desired state and restarts only
+what differs: **one node at a time** for ordinary changes (every peer ready
+and every drive online before a node goes down, every drive online again
+after it), **all changed nodes together** for an RPC secret or a volume
+change, or when `rustfs_rolling_restart: false`. A run that died half way,
+or a `--tags config` run, is completed by the next run with exactly one
 restart. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#restart-decision-and-rolling-restart).
 
 - Run the role against the whole cluster in one play with the default
-  linear strategy. **Do not set `serial`** (refused): the role serialises
-  restarts itself.
+  linear strategy (`strategy: free` or `host_pinned` is refused where the
+  role compares hosts). **Do not set `serial`** (refused): the role
+  serialises restarts itself, over the changed nodes of the whole play.
 - `--limit <node>` is fine for day-2 work on a healthy cluster, but cannot
-  bootstrap a cluster (refused). Add or replace nodes with a full-cluster
+  bootstrap a cluster, and cannot change `rustfs_volumes`, the RPC secret,
+  the root credentials or the IAM master key (all refused: they must change
+  on every node in the same run). Add or replace nodes with a full-cluster
   run.
+- With a drive offline, a rolling restart is refused: replace the drive
+  first ([TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-drive-is-offline)),
+  or use `rustfs_rolling_restart: false` in a maintenance window.
 - Stage tags `install`, `config`, `tls` and `service` select stages when the
   role is applied statically (`roles:` or `import_role`); the guards are
-  tagged `always` and run with any selection.
+  tagged `always` and run with any selection. A start or restart loads the
+  files on disk, so `--tags service` refuses when a changed variable has
+  not been rendered yet: include `config` (and `install` for a version).
 - A failed rollout stops the play on every host; re-running it resumes.
 
 ### Upgrade
 
 Read the release notes of every version you cross, then set
 `rustfs_version` (and update `rustfs_checksum` if you pin digests yourself).
-The run downloads and verifies the new binary on every node, flips the
-symlinks (running processes keep the old binary), then restarts the nodes
-one at a time. Upstream rules: finish the upgrade on every node before any
-pool change or decommission, and never enable a "version floor" feature
-gate (see [CONFIGURATION.md](docs/CONFIGURATION.md#notes)) while versions
-are mixed.
+The run downloads and verifies the new binary on every node, then restarts
+the nodes one at a time, switching each node's `rustfs` symlink right
+before its restart: a rollout that stops at the first node leaves the others
+on the old binary, even if they restart or reboot before you roll back.
+Upstream rules: finish the upgrade on every node before any pool change or
+decommission, and never enable a "version floor" feature gate (see
+[CONFIGURATION.md](docs/CONFIGURATION.md#notes)) while versions are mixed.
 
 ### Rollback
 
@@ -297,17 +318,34 @@ Upstream documents only an immediate rollback to the previous release.
 - **RPC secret:** change `rustfs_rpc_secret` and run the play. Old and new
   secret cannot talk to each other, so the role restarts the cluster
   together (a short outage).
-- **IAM master key:** set the new `rustfs_iam_master_key` and keep the old
-  one in `rustfs_extra_secret_env` (rolling restart):
+- **IAM master key:** RustFS encrypts IAM data with the current key,
+  decrypts with it and with `RUSTFS_IAM_MASTER_KEY_OLD_KEYS` (a
+  comma-separated list), and rewrites every entry it read with an old key
+  using the current one. A node restarted with the new key therefore
+  rewrites IAM data that nodes still running with only the old key cannot
+  read (`NoSuchUser`). Rotate a cluster in **two runs**, each a rolling
+  restart:
 
   ```yaml
+  # Run 1: every node learns to decrypt the new key, still encrypts with the old one.
+  rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key_1 }}"
+  rustfs_extra_secret_env:
+    RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ vault_rustfs_iam_master_key_2 }}"
+  ```
+
+  ```yaml
+  # Run 2: swap them; every node can still read entries of the old key.
   rustfs_iam_master_key: "{{ vault_rustfs_iam_master_key_2 }}"
   rustfs_extra_secret_env:
     RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ vault_rustfs_iam_master_key_1 }}"
   ```
 
-  RustFS rewrites IAM entries with the new key lazily; keep the old key in
-  the list for as long as any entry may still use it.
+  A single node needs only run 2. Preflight refuses a change that drops the
+  key a node runs with from the old keys (its IAM data would become
+  unreadable) and, in a cluster, a new current key that a running node
+  cannot decrypt yet (run 2 before run 1 completed on every node). Keep the
+  old key listed: RustFS rewrites entries as it reads them, and IAM is read
+  in full at every start.
 
 ### Pool expansion and decommission
 
@@ -323,13 +361,21 @@ renders and restarts.
 
 ### Drives and reboots
 
-Mount every drive through `/etc/fstab` by UUID with `nofail`. With
-`rustfs_require_mounted_drives: true` (the default) the unit carries
-`RequiresMountsFor` and `AssertPathIsMountPoint` for each data dir: after a
-reboot with a failed mount, the host boots, RustFS on that node stays down
-instead of writing to the root disk, and the rest of the cluster keeps
-serving. Replace a failed disk with an empty, identically formatted one at
-the same path; RustFS heals it.
+Mount every drive through `/etc/fstab` by UUID with `nofail`, on a mount
+point that stays `root:root` while unmounted. With
+`rustfs_require_mounted_drives: true` (the default) the role runs only when
+every data dir is mounted, and the unit is ordered after the mounts without
+depending on them. After a reboot with a failed mount, or when a disk drops
+out at runtime, the node keeps serving on its other drives (one offline
+drive, not a node down), and RustFS cannot write to the root-owned directory
+below the mount point. Boot does not wait for RustFS either.
+
+To replace a failed disk: mount an empty, identically formatted one at the
+same path, restart RustFS on that node (so it sees the new mount), run the
+play for that node (it sets the owner of the new filesystem; `--limit` is
+fine), and wait until no node lists the drive in `/health/ready` any more
+(RustFS formats and heals it). Until then rolling restarts are refused. Step
+by step: [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-drive-is-offline).
 
 ### Service user and group
 
@@ -349,13 +395,16 @@ ansible-galaxy collection install -r requirements.yml
 # Offline (no RustFS binary): render the files in many variants; variable, layout and TLS guard refusals
 molecule test -s render
 
-# Single node, four drives, generated TLS: install, start, S3 round trip, behaviour plays
+# Single node, four tmpfs drives, generated TLS: install, start, S3 round trip,
+# behaviour plays (stage tags, an unmounted and a replaced drive, certificate
+# reloads, IAM master key change, symlinked binary directory, proxies)
 molecule test -s default
 
 # Upgrade, downgrade refusal and rollback between two releases
 molecule test -s upgrade
 
-# Four-node cluster: parallel bootstrap, rolling and together restarts, dead peer, idempotence
+# Four-node cluster with tmpfs drives: parallel bootstrap, rolling and together
+# restarts, dead peer, offline drive, free strategy, two-run IAM key rotation
 molecule test -s distributed
 
 # Another distribution (debian12 is the default)
@@ -396,14 +445,14 @@ ansible-role-rustfs/
 |-- tasks/
 |   |-- main.yml                   # orchestrator
 |   |-- validate.yml               # variable and play-shape guards (tag always)
-|   |-- preflight.yml              # read-only host guards (tag always)
-|   |-- install.yml                # user, checksum-verified versioned binary, symlink
+|   |-- preflight.yml              # read-only host and process probes and guards (tag always)
+|   |-- install.yml                # user, deps, checksum-verified versioned binary and its digest file
 |   |-- config.yml                 # directories, secrets.env, unit, env file
 |   |-- tls.yml                    # dispatch BYO or generated TLS
-|   |-- tls_byo.yml                # BYO owner/mode, validity, SAN and key checks
+|   |-- tls_byo.yml                # BYO owner/mode, validity, EKU, SAN and key checks
 |   |-- tls_generate.yml           # dev/test CA and node certificates (community.crypto)
-|   |-- service.yml                # probe, restart decision, start, rollout, quorum gate
-|   |-- restart_node.yml           # one node: peer check, restart, wait, re-admission
+|   |-- service.yml                # restart decision, symlink, start, rollout, quorum gate
+|   |-- restart_node.yml           # one node: peer and drive checks, symlink, restart, wait, re-admission
 |   `-- wait_ready.yml             # one node: new main PID, then /health/ready
 |-- templates/
 |   |-- rustfs.env.j2
