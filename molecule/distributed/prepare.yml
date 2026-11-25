@@ -1,8 +1,9 @@
 ---
 # Prepare the four distributed containers before the role runs.
 # Play 1 bootstraps Python plus curl (S3 requests in side_effect and verify)
-# and openssl (certificate check in verify). Nothing RustFS-specific: the
-# role creates the user, installs its package dependencies and the binary.
+# and openssl (certificate check in verify), and mounts a tmpfs at each data
+# dir. Nothing RustFS-specific: the role creates the user, installs its
+# package dependencies and the binary.
 # Plays 2 and 3 test preflight P7 while the hosts are still empty: a first
 # bootstrap that runs on three of the four cluster hosts must be refused
 # before anything is written, so no host has an env file afterwards.
@@ -31,6 +32,11 @@
         { command -v curl >/dev/null 2>&1 || dnf install -y curl; }
       changed_when: true
       when: "'dnf' in __verify_pkg_mgr['stdout']"
+
+    - name: Mount the two test drives
+      ansible.builtin.include_tasks: ../shared/tasks/mount_drives.yml
+      vars:
+        __verify_drives: [/data/rustfs0, /data/rustfs1]
 
 # P7 (spec 5.2): rustfs-node4 is a cluster host (rustfs_cluster_hosts is the
 # rustfs group) but not in this play, and no host has the env file yet.

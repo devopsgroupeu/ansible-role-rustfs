@@ -115,6 +115,20 @@
         that: rustfs_node_address == 'localhost'
         fail_msg: "rustfs_node_address for a wildcard listener is {{ rustfs_node_address }}"
 
+    # Volume hosts lose the brackets of an IPv6 literal, so they compare with
+    # rustfs_node_address; the SAN is an IP SAN without brackets.
+    - name: Assert IPv6 literal volume hosts
+      vars:
+        rustfs_volumes: ["https://[fd00::{1...4}]:9000/data/rustfs{0...3}"]
+        rustfs_node_address: "fd00::1"
+      ansible.builtin.assert:
+        that:
+          - __rustfs_volume_hosts == ['fd00::1', 'fd00::2', 'fd00::3', 'fd00::4']
+          - rustfs_node_address in __rustfs_volume_hosts
+          - __rustfs_node_is_ip | bool
+          - "'IP:fd00::1' in __rustfs_tls_sans"
+        fail_msg: "IPv6 volume hosts {{ __rustfs_volume_hosts }}, SANs {{ __rustfs_tls_sans }}"
+
 # ------------------------------------------------------------------------------
 # Negative plays: each case includes the role inside block / rescue and checks
 # the refusal with molecule/shared/tasks/expect_failure.yml (the message holds
@@ -289,6 +303,108 @@
           vars:
             __verify_expect: "backslash"
             __verify_secret: 'molecule-secret\key-0123456789'
+
+# RustFS trims the secret key, so a vaulted value with a leading space would
+# differ from the one RustFS uses.
+- name: "Negative: secret key with surrounding whitespace"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_secret_key: " molecule-secret-key-0123456789"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a secret key with a leading space"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_secret_key: the value contains"
+            __verify_secret: " molecule-secret-key-0123456789"
+
+# RUSTFS_IAM_MASTER_KEY_OLD_KEYS is split on commas: a key with a comma could
+# never be listed as an old key.
+- name: "Negative: comma in the IAM master key"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_iam_master_key: "molecule-iam-master-key,0123456789"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted an IAM master key with a comma"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "without a comma"
+            __verify_secret: "molecule-iam-master-key,0123456789"
+
+# Without a pinned digest or rustfs_checksum the zip and SHA256SUMS would
+# both come from a plain HTTP origin.
+- name: "Negative: plain HTTP mirror without a digest"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_version: "1.0.5"
+            rustfs_download_base_url: "http://mirror.example.com/rustfs"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a plain HTTP mirror without a digest"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "is not an https:// URL"
+            __verify_secret: ""
+
+# validate.yml repeats the choices of meta/argument_specs.yml for runs
+# without argument validation.
+- name: "Negative: choice variable without argument validation"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+            rolespec_validate: false
+          vars:
+            rustfs_service_state: "restarted"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted rustfs_service_state restarted"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_service_state 'restarted' (started, stopped)"
+            __verify_secret: ""
 
 # {0..3} is shell syntax; RustFS needs {0...3}.
 - name: "Negative: two-dot ellipsis"
@@ -630,6 +746,59 @@
             __verify_expect: "RUSTFS_ERASURE_SET_DRIVE_COUNT"
             __verify_secret: ""
 
+# Without the env file (moved, or rustfs_env_file pointed elsewhere) and
+# without a running process, a formatted drive still proves a deployed
+# layout the role cannot compare with.
+- name: "Negative: formatted drive without a deployed layout"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Create the metadata directory of a formatted drive
+          ansible.builtin.file:
+            path: /data/rustfs0/.rustfs.sys
+            state: directory
+            owner: rustfs
+            group: rustfs
+            mode: "0750"
+
+        - name: Mark the drive as formatted
+          ansible.builtin.copy:
+            content: "{}"
+            dest: /data/rustfs0/.rustfs.sys/format.json
+            owner: rustfs
+            group: rustfs
+            mode: "0640"
+
+        - name: Move the env file away
+          ansible.builtin.command: mv /etc/default/rustfs /root/env.bak
+          changed_when: true
+
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a formatted drive without a deployed layout"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "a data dir holds a formatted RustFS drive"
+            __verify_secret: ""
+      always:
+        - name: Move the env file back
+          ansible.builtin.command: mv /root/env.bak /etc/default/rustfs
+          changed_when: true
+
+        - name: Remove the formatted-drive marker
+          ansible.builtin.file:
+            path: /data/rustfs0/.rustfs.sys
+            state: absent
+
 # BYO material is the operator's job: a missing key is refused by path.
 - name: "Negative: missing BYO TLS key"
   hosts: all
@@ -761,6 +930,12 @@
           - "'ProtectSystem=strict' in __verify_unit"
           - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /var/lib/rustfs-extra' in __verify_unit"
           - "'TimeoutStartSec=infinity' in __verify_unit"
+          # Boot does not wait for the unit; the service defaults are kept.
+          - "'DefaultDependencies=no' in __verify_unit.splitlines()"
+          - "'Requires=sysinit.target' in __verify_unit.splitlines()"
+          - "'After=sysinit.target basic.target' in __verify_unit.splitlines()"
+          - "'Conflicts=shutdown.target' in __verify_unit.splitlines()"
+          - "'Before=shutdown.target' in __verify_unit.splitlines()"
           - __verify_unit is search('(?m)^CapabilityBoundingSet=$')
           - __verify_unit is search('(?m)^AmbientCapabilities=$')
           - "'ExecReload' not in __verify_unit"
@@ -920,6 +1095,64 @@
       always:
         - name: Move the BYO TLS key back
           ansible.builtin.command: mv /root/key.bak /etc/rustfs/tls/rustfs_key.pem
+          changed_when: true
+
+# Same key and SANs, but EKU clientAuth only: RustFS refuses such a server
+# certificate when it loads it, which "rustfs tls inspect" does not notice.
+- name: "Negative: BYO certificate without serverAuth"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Move the BYO certificate away
+          ansible.builtin.command: mv /etc/rustfs/tls/rustfs_cert.pem /root/cert.bak
+          changed_when: true
+
+        - name: Create a CSR with EKU clientAuth only
+          community.crypto.openssl_csr_pipe:
+            privatekey_path: /etc/rustfs/tls/rustfs_key.pem
+            common_name: rustfs-render1
+            use_common_name_for_san: false
+            subject_alt_name:
+              - "DNS:rustfs-render1"
+              - "DNS:localhost"
+              - "IP:127.0.0.1"
+            extended_key_usage:
+              - clientAuth
+          register: __verify_client_csr
+          changed_when: false
+
+        - name: Sign the clientAuth-only certificate
+          community.crypto.x509_certificate:
+            path: /etc/rustfs/tls/rustfs_cert.pem
+            csr_content: "{{ __verify_client_csr['csr'] }}"
+            provider: ownca
+            ownca_path: /etc/rustfs/tls/ca.crt
+            ownca_privatekey_path: /root/rustfs-molecule-ca.key
+            ownca_not_before: "-1d"
+            ownca_not_after: "+30d"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a BYO certificate without serverAuth"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "without serverAuth"
+            __verify_secret: ""
+      always:
+        - name: Move the BYO certificate back
+          ansible.builtin.command: mv /root/cert.bak /etc/rustfs/tls/rustfs_cert.pem
           changed_when: true
 
 # The certificate covers rustfs-render1, not node1.example.com.
@@ -1096,15 +1329,18 @@
     - name: Read the rendered files
       ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
 
-    - name: Assert the unit requires and asserts every data dir mount
+    # Ordering only: a drive that is not mounted must not keep the node down
+    # (no RequiresMountsFor, no AssertPathIsMountPoint).
+    - name: Assert the unit is ordered after every data dir mount without depending on it
       ansible.builtin.assert:
         that:
-          - "'RequiresMountsFor=/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3' in __verify_unit"
-          - __verify_unit | regex_findall('(?m)^AssertPathIsMountPoint=(.*)$') == ['/data/rustfs0', '/data/rustfs1', '/data/rustfs2', '/data/rustfs3']
+          - "'After=data-rustfs0.mount data-rustfs1.mount data-rustfs2.mount data-rustfs3.mount' in __verify_unit.splitlines()"
           # [Unit] directives are ignored by systemd anywhere else.
-          - __verify_unit.index('AssertPathIsMountPoint=') < __verify_unit.index('[Service]')
-          - __verify_unit.index('RequiresMountsFor=') < __verify_unit.index('[Service]')
-        fail_msg: "RequiresMountsFor or one AssertPathIsMountPoint per data dir is missing from [Unit]"
+          - __verify_unit.index('After=data-rustfs0.mount') < __verify_unit.index('[Service]')
+          - "'RequiresMountsFor' not in __verify_unit"
+          - "'AssertPathIsMountPoint' not in __verify_unit"
+          - "'BindsTo' not in __verify_unit"
+        fail_msg: "the unit is not ordered after the data dir mounts, or depends on them"
 
 # With the OS trust store, ca.crt is optional: the role must not require it.
 - name: Converge trust system CA

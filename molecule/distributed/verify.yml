@@ -178,6 +178,40 @@
           '{{ __verify_get_side_effect['stdout'] }}', verify object
           '{{ __verify_get_verify['stdout'] | default('not read here') }}'
 
+# A day-2 run with --limit: the first role run of this playbook, on one
+# node, so the other nodes have no probe URL fact and their peer URLs are
+# built from the inventory (validate.yml fallback). Render mode with the
+# running variables, so nothing changes.
+- name: "Behaviour: a --limit run builds the peer URLs from the inventory"
+  hosts: rustfs-node2
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Assert no other node has a probe URL fact yet
+      ansible.builtin.assert:
+        that:
+          - groups['rustfs'] | reject('equalto', inventory_hostname) | map('extract', hostvars)
+            | selectattr('__rustfs_node_url', 'defined') | list | length == 0
+        fail_msg: "a probe URL fact survived from an earlier playbook"
+
+    - name: Include rustfs role in render mode on one node
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+        public: true
+      vars:
+        rustfs_config_only: true
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Assert the peer URLs of the other nodes
+      ansible.builtin.assert:
+        that:
+          - >-
+            __rustfs_peer_urls == [{'name': 'rustfs-node1', 'url': 'https://rustfs-node1:9000'},
+                                   {'name': 'rustfs-node3', 'url': 'https://rustfs-node3:9000'},
+                                   {'name': 'rustfs-node4', 'url': 'https://rustfs-node4:9000'}]
+        fail_msg: "peer URLs {{ __rustfs_peer_urls }}"
+
 # Role included in render mode with public: true, so its defaults can be
 # asserted. The same variables as the running cluster, so nothing changes.
 - name: Verify derived cluster defaults
@@ -268,6 +302,50 @@
           - __verify_state == __verify_state_before
         fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
 
+# Preflight P9: a new RPC secret on one node (a --limit canary) would cut it
+# off from its peers, so it is refused before anything changes.
+- name: "Behaviour: a cluster-wide change under --limit is refused"
+  hosts: rustfs-node1
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "molecule-rpc-secret-canary-0123456789"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role changed the RPC secret on one node"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: >-
+              RUSTFS_RPC_SECRET would change on rustfs-node1, but the cluster hosts
+              ['rustfs-node2', 'rustfs-node3', 'rustfs-node4'] are not in this run
+            __verify_secret: "molecule-rpc-secret-canary-0123456789"
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
 # Rule 22: one host with a diverged cluster variable is refused on every host.
 - name: "Behaviour: inconsistent cluster variables are refused"
   hosts: all
@@ -307,6 +385,88 @@
             __verify_secret: "{{ rustfs_secret_key }}"
 
     # A set_fact outlives the play.
+    - name: Reset rustfs_extra_env on rustfs-node4
+      ansible.builtin.set_fact:
+        rustfs_extra_env: {}
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# The same diverged rustfs-node4, but with strategy free and rustfs-node4
+# starting the role 20 s late: the other nodes reach the consistency check
+# before rustfs-node4 has a fingerprint. They must refuse instead of
+# comparing only with each other. rustfs-node4 then refuses as diverged.
+- name: "Behaviour: the free strategy is refused"
+  hosts: all
+  become: true
+  gather_facts: false
+  strategy: free
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    # As in a fresh playbook run, rustfs-node4 has no fingerprint of an
+    # earlier run of the role when the others look for it.
+    - name: Give rustfs-node4 a different rustfs_extra_env and no fingerprint
+      ansible.builtin.set_fact:
+        rustfs_extra_env:
+          RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE: "bounded"
+        __rustfs_fingerprint: ""
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Delay rustfs-node4
+      ansible.builtin.wait_for:
+        timeout: 20
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a cluster check without every fingerprint"
+      rescue:
+        # Under the free strategy the early nodes also race each other, so
+        # the list of hosts without a fingerprint varies; rustfs-node4 is
+        # always in it.
+        - name: Check the refusal of the early nodes
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "of this play have no cluster fingerprint, but {{ inventory_hostname }} has one"
+            __verify_secret: "{{ rustfs_secret_key }}"
+          when: inventory_hostname != 'rustfs-node4'
+
+        - name: Check the early refusal names rustfs-node4
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "'rustfs-node4'"
+            __verify_secret: ""
+          when: inventory_hostname != 'rustfs-node4'
+
+        - name: Check the refusal of the late node
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "['rustfs-node4'] differ from"
+            __verify_secret: "{{ rustfs_secret_key }}"
+          when: inventory_hostname == 'rustfs-node4'
+
     - name: Reset rustfs_extra_env on rustfs-node4
       ansible.builtin.set_fact:
         rustfs_extra_env: {}
@@ -458,4 +618,312 @@
       ansible.builtin.assert:
         that:
           - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'error'
+      no_log: true
+
+# ------------------------------------------------------------------------------
+# An offline drive. /data/rustfs1 of rustfs-node4 is not mounted: the unit
+# still starts and the cluster serves (8 drives, parity 4), but every node
+# lists the drive. A rolling restart must not take another node down now,
+# because in other layouts that costs an erasure set its quorum: rustfs-node4
+# refuses at its mount guard, rustfs-node1 (the run_once host) before its own
+# restart, rustfs-node2 and rustfs-node3 are aborted by any_errors_fatal. The
+# drive is then replaced the documented way (README, "Drives and reboots").
+# ------------------------------------------------------------------------------
+
+- name: "Behaviour: an offline drive refuses the rolling restart"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_url: "https://{{ inventory_hostname }}:9000"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+  tasks:
+    - name: Stop RustFS on rustfs-node4
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: stopped
+      when: inventory_hostname == 'rustfs-node4'
+
+    - name: Unmount /data/rustfs1 on rustfs-node4
+      ansible.builtin.command: umount /data/rustfs1
+      changed_when: true
+      when: inventory_hostname == 'rustfs-node4'
+
+    # The unit has no mount dependency or assertion, so it starts.
+    - name: Start RustFS on rustfs-node4 without the drive
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: started
+        no_block: true
+      when: inventory_hostname == 'rustfs-node4'
+
+    # A node lists its own missing drive; its peers keep the remote handle
+    # of a host that is online, so they list nothing. The rolling restart of
+    # any other node probes rustfs-node4 as a peer and sees the drive.
+    - name: Wait until every node is ready and rustfs-node4 lists its offline drive
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+        status_code: [200, 503]
+      register: __verify_degraded
+      until: >-
+        __verify_degraded['status'] == 200
+        and (__verify_degraded['json']['details']['storage']['unavailableDrives']
+             + __verify_degraded['json']['details']['storage']['missingDrives']) | length
+            == (1 if inventory_hostname == 'rustfs-node4' else 0)
+      retries: 30
+      delay: 2
+
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Keep the last failure message of each host
+      ansible.builtin.set_fact:
+        __verify_failed_msg_before: "{{ ansible_failed_result['msg'] | default('') }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+            # Short waits: the drive stays offline.
+            rustfs_ready_retries: 3
+            rustfs_ready_delay: 2
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role restarted nodes while a drive was offline"
+      rescue:
+        - name: Check the refusal of the node without the drive
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "these data dirs are not mount points: ['/data/rustfs1']"
+            __verify_secret: "{{ rustfs_secret_key }}"
+          when: inventory_hostname == 'rustfs-node4'
+
+        - name: Check the refusal on the run_once host
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "refusing to restart rustfs-node1: its peers still list drives as unavailable or missing"
+            __verify_secret: "{{ rustfs_secret_key }}"
+          when: inventory_hostname == 'rustfs-node1'
+
+        - name: Assert the other hosts were aborted by any_errors_fatal
+          ansible.builtin.assert:
+            that:
+              - (ansible_failed_result['msg'] | default('')) == __verify_failed_msg_before
+            fail_msg: "{{ inventory_hostname }} failed a task of its own: {{ ansible_failed_result['msg'] | default('') }}"
+          when: inventory_hostname in ['rustfs-node2', 'rustfs-node3']
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert no node was restarted
+      ansible.builtin.assert:
+        that:
+          - __verify_state['main_pid'] == __verify_state_before['main_pid']
+          - __verify_state['main_pid'] | int > 0
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    - name: Clear the failed state the rescued rollout left behind
+      ansible.builtin.meta: clear_host_errors
+
+# The replacement: a new, empty filesystem at the same path, a restart by
+# hand so that RustFS sees the new mount, then the role on that node alone
+# (--limit; nothing cluster-wide changes, so the role allows it) sets the
+# owner of the new filesystem, and RustFS heals the drive by itself. Then
+# the whole cluster rolls the pending level change with every drive online.
+- name: "Behaviour: a replaced drive is taken in"
+  hosts: rustfs-node4
+  become: true
+  gather_facts: false
+  vars:
+    __verify_url: "https://{{ inventory_hostname }}:9000"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+  tasks:
+    - name: Mount a new empty drive at /data/rustfs1
+      ansible.builtin.include_tasks: ../shared/tasks/mount_drives.yml
+      vars:
+        __verify_drives: [/data/rustfs1]
+
+    - name: Restart RustFS on rustfs-node4 to see the new mount
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: restarted
+        no_block: true
+
+    - name: Wait until rustfs-node4 is ready again
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+        status_code: [200, 503]
+      register: __verify_restarted
+      until: __verify_restarted['status'] == 200
+      retries: 30
+      delay: 2
+
+    - name: Run the role on rustfs-node4 alone
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "error"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Stat the new drive
+      ansible.builtin.stat:
+        path: /data/rustfs1
+        get_checksum: false
+      register: __verify_new_drive
+
+    - name: Assert the run set the owner of the new drive and restarted nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_new_drive['stat']['pw_name'] == 'rustfs'
+          - __verify_new_drive['stat']['mode'] == '0750'
+          - not __rustfs_restart_needed
+        fail_msg: "new drive {{ __verify_new_drive['stat']['pw_name'] }} {{ __verify_new_drive['stat']['mode'] }}"
+
+    - name: Wait until rustfs-node4 lists every drive online
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+        status_code: [200, 503]
+      register: __verify_healed
+      until: >-
+        __verify_healed['status'] == 200
+        and __verify_healed['json']['details']['storage']['unavailableDrives'] == []
+        and __verify_healed['json']['details']['storage']['missingDrives'] == []
+      retries: 30
+      delay: 2
+
+- name: "Behaviour: the cluster rolls again with every drive online"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role on every node with the pending level
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Read the running process after the run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert every node rolled onto the pending level
+      ansible.builtin.assert:
+        that:
+          - __rustfs_restart_needed
+          - not __rustfs_restart_together
+          - __rustfs_restart_reasons == ['RUSTFS_OBS_LOGGER_LEVEL']
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'warn'
+        fail_msg: "{{ inventory_hostname }}: reasons {{ __rustfs_restart_reasons | default('unset') }}"
+      no_log: true
+
+# ------------------------------------------------------------------------------
+# IAM master key rotation (README "Rotating secrets"). A one-step rotation
+# (new key current, old key listed) is refused on every node: the first node
+# restarted with the new key would rewrite IAM data the others cannot read
+# yet. Run 1 keeps the current key and lists the new one, run 2 swaps them;
+# both are rolling restarts. Last plays: they leave the rotated key behind.
+# ------------------------------------------------------------------------------
+
+- name: "Behaviour: a one-step IAM master key rotation is refused"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_iam_key_1: "molecule-iam-master-key-0123456789"
+    __verify_iam_key_2: "molecule-iam-master-key-rotated-0123456789"
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+            rustfs_iam_master_key: "{{ __verify_iam_key_2 }}"
+            rustfs_extra_secret_env:
+              RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ __verify_iam_key_1 }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role rotated the IAM master key in one step"
+      rescue:
+        - name: Check the refusal names every node
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: >-
+              rustfs-node1: new key unknown; rustfs-node2: new key unknown;
+              rustfs-node3: new key unknown; rustfs-node4: new key unknown
+            __verify_secret: "{{ __verify_iam_key_2 }}"
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+- name: "Behaviour: the IAM master key rotates in two runs"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_iam_key_1: "molecule-iam-master-key-0123456789"
+    __verify_iam_key_2: "molecule-iam-master-key-rotated-0123456789"
+  tasks:
+    - name: "Run 1: the current key stays, the new key is listed"
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+        rustfs_extra_secret_env:
+          RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ __verify_iam_key_2 }}"
+
+    - name: Keep the decision of run 1
+      ansible.builtin.set_fact:
+        __verify_run_1: "{{ {'needed': __rustfs_restart_needed, 'together': __rustfs_restart_together} }}"
+
+    - name: "Run 2: the new key is current, the old key is listed"
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+        rustfs_iam_master_key: "{{ __verify_iam_key_2 }}"
+        rustfs_extra_secret_env:
+          RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ __verify_iam_key_1 }}"
+
+    - name: Read the running process after run 2
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert both runs rolled and the node runs the new key
+      ansible.builtin.assert:
+        that:
+          - __verify_run_1['needed'] and not __verify_run_1['together']
+          - __rustfs_restart_needed and not __rustfs_restart_together
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY'] == __verify_iam_key_2
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] == __verify_iam_key_1
+        fail_msg: "{{ inventory_hostname }}: the two-run rotation did not apply"
       no_log: true

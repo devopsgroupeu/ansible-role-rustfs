@@ -113,8 +113,34 @@
       no_log: true
 
     # --------------------------------------------------------------------------
-    # Step 2: upgrade, together restart (pinned digest)
+    # Step 2: upgrade, together restart (pinned digest). The install stage
+    # alone (like --tags install) installs the new binary but leaves the
+    # symlink and the process on the old one: the symlink moves only with
+    # the restart of the node, so an aborted rollout leaves the nodes it did
+    # not reach on their old binary, also for a crash restart.
     # --------------------------------------------------------------------------
+
+    - name: Run the install stage of the upgrade only
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+        tasks_from: install.yml
+
+    - name: Record the host state after the install stage
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Stat the new versioned binary after the install stage
+      ansible.builtin.stat:
+        path: "/usr/local/bin/rustfs-{{ __verify_default_version }}-musl"
+        get_checksum: false
+      register: __verify_new_bin
+
+    - name: Assert the install stage switched neither the symlink nor the process
+      ansible.builtin.assert:
+        that:
+          - __verify_new_bin['stat']['exists']
+          - __verify_state['link_target'] == '/usr/local/bin/rustfs-' ~ __molecule_previous_version ~ '-gnu'
+          - __verify_state['main_pid'] | int == __verify_pid_1 | int
+        fail_msg: "after the install stage: {{ __verify_state }}, new binary {{ __verify_new_bin['stat']['exists'] }}"
 
     - name: Upgrade to the default version and build
       ansible.builtin.include_role:

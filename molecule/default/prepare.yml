@@ -1,9 +1,10 @@
 ---
 # Prepare the default container before the role runs.
-# Bootstraps Python (plus curl for verify) and creates the extra sandbox path
-# of rustfs_systemd_read_write_paths. Nothing RustFS-specific: the role
-# creates the user, installs its package dependencies (python3-cryptography
-# among them) and the binary itself.
+# Bootstraps Python (plus curl for verify), creates the extra sandbox path
+# of rustfs_systemd_read_write_paths and mounts a tmpfs at each of the four
+# data dirs, so the role runs with its default rustfs_require_mounted_drives.
+# Nothing RustFS-specific: the role creates the user, installs its package
+# dependencies (python3-cryptography among them) and the binary itself.
 
 - name: Prepare default container
   hosts: all
@@ -41,3 +42,8 @@
         owner: root
         group: root
         mode: "0755"
+
+    - name: Mount the four test drives
+      ansible.builtin.include_tasks: ../shared/tasks/mount_drives.yml
+      vars:
+        __verify_drives: [/data/rustfs0, /data/rustfs1, /data/rustfs2, /data/rustfs3]

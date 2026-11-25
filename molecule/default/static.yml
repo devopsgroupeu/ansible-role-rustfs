@@ -1,0 +1,11 @@
+---
+# The role applied statically, so --tags selects its stages (README, "How
+# restarts work"). Not a Molecule step: verify.yml runs it with
+# ansible-playbook and --tags against the scenario inventory.
+
+- name: Apply the rustfs role statically
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - role: ansible-role-rustfs

@@ -1,0 +1,36 @@
+---
+# Shared helper: gives each path its own tmpfs "drive", so the role runs
+# with its default rustfs_require_mounted_drives: true. Input:
+#   __verify_drives  list of data dir paths
+# As on a real host, the directory below each mount stays root:root 0755
+# (created here before the mount), so RustFS cannot write to it while the
+# drive is not mounted. An empty tmpfs is a new, unformatted drive.
+
+- name: Create the mount points of the test drives
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ __verify_drives }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Check which test drives are mounted
+  ansible.builtin.command:
+    argv: [mountpoint, -q, "{{ item }}"]
+  loop: "{{ __verify_drives }}"
+  loop_control:
+    label: "{{ item }}"
+  register: __verify_drive_mounted
+  failed_when: false
+  changed_when: false
+
+- name: Mount a tmpfs at every test drive
+  ansible.builtin.command:
+    argv: [mount, -t, tmpfs, -o, "size=256m,mode=0755", tmpfs, "{{ item['item'] }}"]
+  loop: "{{ __verify_drive_mounted['results'] | rejectattr('rc', 'equalto', 0) | list }}"
+  loop_control:
+    label: "{{ item['item'] }}"
+  changed_when: true

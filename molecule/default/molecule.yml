@@ -1,9 +1,10 @@
 ---
-# Real install on one container: SNMD (one node, four drive directories)
-# with generated TLS. The role downloads the release zip, verifies it,
-# installs the versioned binary and the symlink, renders the files and
-# generates the CA and the node certificate. check runs after idempotence:
-# a check-mode converge of the converged host must not fail.
+# Real install on one container: SNMD (one node, four tmpfs drives mounted
+# by prepare, so rustfs_require_mounted_drives keeps its default) with
+# generated TLS. The role downloads the release zip, verifies it, installs
+# the versioned binary and the symlink, renders the files and generates the
+# CA and the node certificate. check runs after idempotence: a check-mode
+# converge of the converged host must not fail.
 
 dependency:
   name: galaxy
@@ -57,11 +58,11 @@ provisioner:
         # One extra writable path for the systemd sandbox (created in prepare).
         rustfs_systemd_read_write_paths:
           - "/var/lib/rustfs-extra"
-        # Container: data dirs are plain directories, not mount points.
-        rustfs_require_mounted_drives: false
-        # Container: the four data dirs share one device.
+        # Container: the tmpfs drives are not physical disks.
         rustfs_unsafe_bypass_disk_check: true
-        # Container: the data dirs sit on the overlayfs root filesystem.
+        # Container: while a behaviour play has a tmpfs unmounted, that data
+        # dir sits on the overlayfs root filesystem, which "fail" refuses
+        # (tmpfs itself is supported).
         rustfs_unsupported_fs_policy: "warn"
         # Test root access key (the default "" is refused).
         rustfs_access_key: "MOLECULEADMIN"

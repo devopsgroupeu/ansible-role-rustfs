@@ -6,9 +6,16 @@
 # service: health endpoints over HTTPS against the generated CA, the process
 # user, binary and environment, and an S3 round trip with the
 # special-character secret. The behaviour plays then re-run the role: an
-# interrupted rollout restarts exactly once, three guards refuse and leave
-# the host untouched (main PID, symlink target, env file), and the service
-# can be stopped and disabled and brought back.
+# interrupted rollout restarts exactly once (under a proxy environment the
+# probes ignore), the stage tags of a static role converge, an unmounted
+# drive is refused by the role but not by the unit and a new drive is taken
+# in, two guards refuse and leave the host untouched (main PID, symlink
+# target, env file), a rejected certificate reload restarts the node and an
+# accepted one does not, the probes keep ca.crt with the OS store trusted
+# too, BYO mode accepts the material in place, a symlinked rustfs_bin_dir
+# restarts once and a binary without its digest is installed again, the
+# service can be stopped and disabled and brought back, and an IAM master
+# key change must keep the old key.
 
 - name: Verify install
   hosts: all
@@ -64,6 +71,17 @@
         get_checksum: false
       register: __verify_ca_key
 
+    - name: Stat the versioned binary with its SHA-256
+      ansible.builtin.stat:
+        path: /usr/local/bin/rustfs-1.0.6-musl
+        checksum_algorithm: sha256
+      register: __verify_bin_digest
+
+    - name: Read the digest file of the versioned binary
+      ansible.builtin.slurp:
+        src: /usr/local/bin/rustfs-1.0.6-musl.sha256
+      register: __verify_digest_file
+
     - name: Assert the install and the generated TLS material
       ansible.builtin.assert:
         that:
@@ -85,6 +103,7 @@
           - __verify_cert['valid_at']['in_395d']
           - not __verify_cert['valid_at']['in_405d']
           - __verify_ca_key['stat']['mode'] == '0600'
+          - (__verify_digest_file['content'] | b64decode | trim) == __verify_bin_digest['stat']['checksum']
         fail_msg: >-
           install or TLS check failed: link {{ __verify_link['stat']['lnk_target'] | default('missing') }},
           version output {{ __verify_version['stdout_lines'] }},
@@ -113,6 +132,11 @@
           - "'RUSTFS_UNSUPPORTED_FS_POLICY=\"warn\"' in __verify_env"
           - "'ExecStart=/usr/local/bin/rustfs server' in __verify_unit"
           - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /var/lib/rustfs-extra' in __verify_unit"
+          # Ordered after the tmpfs mounts, never bound to them.
+          - "'After=data-rustfs0.mount data-rustfs1.mount data-rustfs2.mount data-rustfs3.mount' in __verify_unit.splitlines()"
+          - "'RequiresMountsFor' not in __verify_unit"
+          - "'AssertPathIsMountPoint' not in __verify_unit"
+          - "'DefaultDependencies=no' in __verify_unit.splitlines()"
         fail_msg: "the unit or the env file is wrong"
 
     # The secret must reach secrets.env byte for byte and nothing else.
@@ -135,6 +159,7 @@
         get_checksum: false
       loop:
         - {path: /usr/local/bin/rustfs-1.0.6-musl, dir: false, owner: root, group: root, mode: "0755"}
+        - {path: /usr/local/bin/rustfs-1.0.6-musl.sha256, dir: false, owner: root, group: root, mode: "0644"}
         - {path: /opt/rustfs, dir: true, owner: rustfs, group: rustfs, mode: "0750"}
         - {path: /etc/rustfs, dir: true, owner: root, group: rustfs, mode: "0750"}
         - {path: /etc/rustfs/tls, dir: true, owner: root, group: rustfs, mode: "0750"}
@@ -214,6 +239,19 @@
           - "{{ __verify_proc_pid }}"
       register: __verify_ps
       changed_when: false
+
+    # DefaultDependencies=no in the unit: boot does not wait for a node that
+    # waits for quorum (a read-only property query).
+    - name: Read the ordering of multi-user.target
+      ansible.builtin.command: systemctl show multi-user.target --property=After --value # noqa: command-instead-of-module
+      register: __verify_target_after
+      changed_when: false
+
+    - name: Assert multi-user.target does not wait for RustFS
+      ansible.builtin.assert:
+        that:
+          - "'rustfs.service' not in __verify_target_after['stdout'].split()"
+        fail_msg: "multi-user.target is ordered after: {{ __verify_target_after['stdout'] }}"
 
     - name: Probe /health/ready
       ansible.builtin.uri:
@@ -319,11 +357,19 @@
 # Review Focus 1 (spec 10.1 play 1): a --tags config style run (here
 # rustfs_config_only) renders a change without touching the service; the
 # next normal run must restart exactly once, in the rolling path, and the
-# run after that must not restart again.
+# run after that must not restart again. The play runs with a proxy in the
+# environment that refuses every connection: the health probes (readiness
+# wait, write-quorum gate) must not use it.
 - name: "Behaviour: interrupted rollout restarts once"
   hosts: all
   become: true
   gather_facts: false
+  environment:
+    http_proxy: "http://127.0.0.1:9"
+    https_proxy: "http://127.0.0.1:9"
+    HTTP_PROXY: "http://127.0.0.1:9"
+    HTTPS_PROXY: "http://127.0.0.1:9"
+    no_proxy: ""
   tasks:
     - name: Record the host state
       ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
@@ -400,21 +446,132 @@
           main PID {{ __verify_pid_restarted }} -> {{ __verify_proc_pid }},
           reasons {{ __rustfs_restart_reasons | default('unset') }}
 
-# ------------------------------------------------------------------------------
-# Guard plays: each records the host state, runs the role inside
-# block / rescue with one guard tripped, checks the refusal with
-# molecule/shared/tasks/expect_failure.yml (the message names the variable
-# or path and never the secret), then proves the state is unchanged. All
-# three guards are in preflight.yml, so they refuse before install, config
-# or service.
-# ------------------------------------------------------------------------------
-
-# The data dirs are plain directories in the container (spec 10.1 play 2).
-- name: "Behaviour: mount guard refuses unmounted drives"
+# README "How restarts work": the stage tags select stages when the role is
+# applied statically (static.yml, roles:). Each step is a separate
+# ansible-playbook run on the controller against the molecule inventory.
+# --tags service after a variable change refuses (the files on disk still
+# hold the old value, so a restart would not converge); --tags
+# config,service then renders and restarts once; --tags install changes
+# nothing on an installed host.
+- name: "Behaviour: stage tags, the state before"
   hosts: all
   become: true
   gather_facts: false
   tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the tagged runs
+      ansible.builtin.set_fact:
+        __verify_state_tags: "{{ __verify_state }}"
+
+- name: "Behaviour: stage tags, the tagged runs"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    __verify_tags_cmd:
+      - "{{ ansible_playbook_python | dirname }}/ansible-playbook"
+      - -i
+      - "{{ lookup('ansible.builtin.env', 'MOLECULE_INVENTORY_FILE') }}"
+      - "{{ playbook_dir }}/static.yml"
+      # Back to the scenario level (the play above left "warn"), so the
+      # later plays run without a pending change.
+      - -e
+      - rustfs_log_level=info
+  tasks:
+    - name: Run only the service stage after a variable change
+      ansible.builtin.command:
+        argv: "{{ __verify_tags_cmd + ['--tags', 'service'] }}"
+      register: __verify_tags_service
+      failed_when: false
+      changed_when: false
+
+    # ansible-core prints the error of a failed task to stderr.
+    - name: Assert the service stage refused the stale files
+      vars:
+        __verify_tags_output: "{{ __verify_tags_service['stdout'] ~ __verify_tags_service['stderr'] }}"
+      ansible.builtin.assert:
+        that:
+          - __verify_tags_service['rc'] == 2
+          - "'do not match the role variables' in __verify_tags_output"
+          - "'RUSTFS_OBS_LOGGER_LEVEL' in __verify_tags_output"
+        fail_msg: "rc {{ __verify_tags_service['rc'] }}: {{ __verify_tags_service['stderr_lines'][-10:] }}"
+
+    - name: Run the config and service stages
+      ansible.builtin.command:
+        argv: "{{ __verify_tags_cmd + ['--tags', 'config,service'] }}"
+      register: __verify_tags_apply
+      failed_when: false
+      changed_when: true
+
+    - name: Run only the install stage
+      ansible.builtin.command:
+        argv: "{{ __verify_tags_cmd + ['--tags', 'install'] }}"
+      register: __verify_tags_install
+      failed_when: false
+      changed_when: false
+
+    - name: Assert the tagged runs succeeded
+      ansible.builtin.assert:
+        that:
+          - __verify_tags_apply['rc'] == 0
+          - "'restarts in the rolling order' in __verify_tags_apply['stdout']"
+          - __verify_tags_install['rc'] == 0
+          - __verify_tags_install['stdout'] is search('changed=0 ')
+        fail_msg: >-
+          config,service rc {{ __verify_tags_apply['rc'] }}: {{ __verify_tags_apply['stdout_lines'][-25:] }};
+          install rc {{ __verify_tags_install['rc'] }}: {{ __verify_tags_install['stdout_lines'][-10:] }}
+
+- name: "Behaviour: stage tags, the state after"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the running process after the tagged runs
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the tagged runs restarted once onto the new level
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_pid | int != __verify_state_tags['main_pid'] | int
+          - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'info'
+        fail_msg: "main PID {{ __verify_state_tags['main_pid'] }} -> {{ __verify_proc_pid }}"
+      no_log: true
+
+# ------------------------------------------------------------------------------
+# Drives and guards. The guard plays record the host state, run the role
+# inside block / rescue with one guard tripped, check the refusal with
+# molecule/shared/tasks/expect_failure.yml (the message names the variable
+# or path and never the secret), then prove the state is unchanged. The
+# guards are in preflight.yml, so they refuse before install, config or
+# service.
+# ------------------------------------------------------------------------------
+
+# Spec 10.1 play 2. A drive that is not mounted (a failed mount at boot, a
+# pulled disk): the role refuses to run, because it would set the owner of
+# the directory below the mount, but the unit still starts and RustFS
+# serves on the other drives without writing to that root-owned directory.
+# A new, empty drive at the same path is taken in the documented way
+# (README, "Drives and reboots"): a restart by hand makes the new mount
+# visible to RustFS, the role run then sets the owner of the new
+# filesystem, and RustFS formats and heals it by itself.
+- name: "Behaviour: an unmounted drive is one offline drive"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_url: "https://localhost:9000"
+    __verify_ca: /etc/rustfs/tls/ca.crt
+  tasks:
+    - name: Stop RustFS
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: stopped
+
+    - name: Unmount the drive /data/rustfs3
+      ansible.builtin.command: umount /data/rustfs3
+      changed_when: true
+
     - name: Record the host state
       ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
 
@@ -427,17 +584,15 @@
         - name: Include rustfs role
           ansible.builtin.include_role:
             name: ansible-role-rustfs
-          vars:
-            rustfs_require_mounted_drives: true
 
         - name: Fail because the role did not refuse
           ansible.builtin.fail:
-            msg: "role accepted data dirs that are not mount points"
+            msg: "role accepted a data dir that is not a mount point"
       rescue:
         - name: Check the refusal
           ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
           vars:
-            __verify_expect: "rustfs_require_mounted_drives"
+            __verify_expect: "these data dirs are not mount points: ['/data/rustfs3']"
             __verify_secret: "{{ rustfs_secret_key }}"
 
     - name: Record the host state after the refusal
@@ -449,6 +604,129 @@
           - __verify_state == __verify_state_before
           - __verify_state['link_target'] == '/usr/local/bin/rustfs-1.0.6-musl'
         fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    - name: Start the unit without the drive
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: started
+        no_block: true
+
+    - name: Wait until the node is ready without the drive
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+        status_code: [200, 503]
+      register: __verify_degraded
+      until: __verify_degraded['status'] == 200
+      retries: 30
+      delay: 2
+      failed_when: __verify_degraded['status'] != 200
+
+    - name: Stat the directory below the mount
+      ansible.builtin.stat:
+        path: /data/rustfs3
+        get_checksum: false
+      register: __verify_bare_dir
+
+    - name: Find files RustFS wrote below the mount
+      ansible.builtin.find:
+        paths: /data/rustfs3
+        file_type: any
+        hidden: true
+        recurse: true
+      register: __verify_bare_files
+
+    - name: Assert RustFS serves on three drives and wrote nothing to the root disk
+      vars:
+        __verify_offline: >-
+          {{ __verify_degraded['json']['details']['storage']['unavailableDrives']
+             + __verify_degraded['json']['details']['storage']['missingDrives'] }}
+      ansible.builtin.assert:
+        that:
+          - __verify_degraded['json']['ready'] is true
+          - __verify_offline | length == 1
+          - __verify_bare_dir['stat']['pw_name'] == 'root'
+          - __verify_bare_dir['stat']['mode'] == '0755'
+          - __verify_bare_files['files'] | length == 0
+        fail_msg: >-
+          ready {{ __verify_degraded['json'] }}, /data/rustfs3
+          {{ __verify_bare_dir['stat']['pw_name'] }} {{ __verify_bare_dir['stat']['mode'] }},
+          files {{ __verify_bare_files['files'] | map(attribute='path') | list }}
+
+    - name: Mount a new empty drive at /data/rustfs3
+      ansible.builtin.include_tasks: ../shared/tasks/mount_drives.yml
+      vars:
+        __verify_drives: [/data/rustfs3]
+
+    # A filesystem mounted after the start is not visible in the namespace
+    # of the running process.
+    - name: Restart RustFS to see the new mount
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: restarted
+        no_block: true
+
+    # The new filesystem root is root:root, so RustFS cannot use it yet.
+    - name: Wait until the node is ready again, still without the drive
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+        status_code: [200, 503]
+      register: __verify_remounted
+      until: >-
+        __verify_remounted['status'] == 200
+        and (__verify_remounted['json']['details']['storage']['unavailableDrives']
+             + __verify_remounted['json']['details']['storage']['missingDrives']) | length == 1
+      retries: 30
+      delay: 2
+
+    - name: Read the running process before the role run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Keep the main PID before the role run
+      ansible.builtin.set_fact:
+        __verify_pid_degraded: "{{ __verify_proc_pid }}"
+
+    - name: Run the role with the new drive
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+    - name: Read the running process after the role run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Stat the new drive
+      ansible.builtin.stat:
+        path: /data/rustfs3
+        get_checksum: false
+      register: __verify_new_drive
+
+    # RustFS notices the writable drive by itself, formats and heals it.
+    - name: Wait until RustFS lists every drive online
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+        status_code: [200, 503]
+      register: __verify_healed
+      until: >-
+        __verify_healed['status'] == 200
+        and __verify_healed['json']['details']['storage']['unavailableDrives'] == []
+        and __verify_healed['json']['details']['storage']['missingDrives'] == []
+      retries: 30
+      delay: 2
+
+    - name: Assert the role took in the new drive without a restart
+      ansible.builtin.assert:
+        that:
+          - __verify_new_drive['stat']['pw_name'] == 'rustfs'
+          - __verify_new_drive['stat']['mode'] == '0750'
+          - __verify_proc_pid | int == __verify_pid_degraded | int
+          - not __rustfs_restart_needed
+          - __verify_healed['json']['details']['storage']['unavailableDrives'] == []
+          - __verify_healed['json']['details']['storage']['missingDrives'] == []
+        fail_msg: >-
+          new drive {{ __verify_new_drive['stat']['pw_name'] }} {{ __verify_new_drive['stat']['mode'] }},
+          main PID {{ __verify_pid_degraded }} -> {{ __verify_proc_pid }},
+          ready {{ __verify_healed['json'] }}
 
 # A manual install being adopted (spec 10.1 play 3, Review Focus 5).
 - name: "Behaviour: unmanaged binary is refused"
@@ -574,9 +852,343 @@
           - __verify_state == __verify_state_before
         fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
 
+# Preflight P5 also compares with the running process: with the env file
+# elsewhere (a new rustfs_env_file, a lost file), a changed erasure set size
+# is still refused, and nothing is written.
+- name: "Behaviour: a layout change is refused against the running process"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_env_file: /etc/default/rustfs-elsewhere
+            rustfs_extra_env:
+              RUSTFS_ERASURE_SET_DRIVE_COUNT: "4"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a layout change without an env file to compare with"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: 'RUSTFS_ERASURE_SET_DRIVE_COUNT in the running process "unset", desired "4"'
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Stat the env file the refused run named
+      ansible.builtin.stat:
+        path: /etc/default/rustfs-elsewhere
+        get_checksum: false
+      register: __verify_env_elsewhere
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+          - not __verify_env_elsewhere['stat']['exists']
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# ------------------------------------------------------------------------------
+# TLS on a running node
+# ------------------------------------------------------------------------------
+
+# Without the extra SAN the re-signed certificate drops a name of the one
+# RustFS serves, so RustFS rejects the hot reload and keeps the old one: the
+# role restarts the node ('tls'). Adding the SAN back keeps every name, so
+# RustFS reloads it and the role restarts nothing.
+- name: "Behaviour: a rejected certificate reload restarts the node"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the running process before the certificate change
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Keep the main PID before the certificate change
+      ansible.builtin.set_fact:
+        __verify_pid_cert: "{{ __verify_proc_pid }}"
+
+    - name: Run the role without the extra SAN
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_tls_extra_sans: []
+
+    - name: Read the running process after the rejected reload
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Read the certificate file after the rejected reload
+      community.crypto.x509_certificate_info:
+        path: /etc/rustfs/tls/rustfs_cert.pem
+      register: __verify_cert_file
+
+    - name: Read the served certificate after the rejected reload
+      community.crypto.get_certificate:
+        host: localhost
+        port: 9000
+      register: __verify_cert_served
+
+    - name: Assert the node restarted onto the new certificate
+      ansible.builtin.assert:
+        that:
+          - __rustfs_restart_needed
+          - not __rustfs_restart_together
+          - __rustfs_restart_reasons == ['tls']
+          - __verify_proc_pid | int != __verify_pid_cert | int
+          - "'DNS:rustfs.molecule.test' not in __verify_cert_file['subject_alt_name']"
+          - __verify_cert_served['serial_number'] == __verify_cert_file['serial_number']
+        fail_msg: >-
+          reasons {{ __rustfs_restart_reasons | default('unset') }}, main PID
+          {{ __verify_pid_cert }} -> {{ __verify_proc_pid }}, served serial
+          {{ __verify_cert_served['serial_number'] }}, file serial {{ __verify_cert_file['serial_number'] }}
+
+    - name: Keep the main PID after the restart
+      ansible.builtin.set_fact:
+        __verify_pid_cert: "{{ __verify_proc_pid }}"
+
+    - name: Run the role with the extra SAN again
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+    - name: Read the running process after the accepted reload
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Read the certificate file after the accepted reload
+      community.crypto.x509_certificate_info:
+        path: /etc/rustfs/tls/rustfs_cert.pem
+      register: __verify_cert_file
+
+    - name: Read the served certificate after the accepted reload
+      community.crypto.get_certificate:
+        host: localhost
+        port: 9000
+      register: __verify_cert_served
+
+    - name: Assert RustFS reloaded the certificate without a restart
+      ansible.builtin.assert:
+        that:
+          - not __rustfs_restart_needed
+          - __rustfs_restart_reasons == []
+          - __verify_proc_pid | int == __verify_pid_cert | int
+          - "'DNS:rustfs.molecule.test' in __verify_cert_file['subject_alt_name']"
+          - __verify_cert_served['serial_number'] == __verify_cert_file['serial_number']
+        fail_msg: >-
+          reasons {{ __rustfs_restart_reasons | default('unset') }}, main PID
+          {{ __verify_pid_cert }} -> {{ __verify_proc_pid }}, served serial
+          {{ __verify_cert_served['serial_number'] }}, file serial {{ __verify_cert_file['serial_number'] }}
+
+# RUSTFS_TRUST_SYSTEM_CA adds the OS store to ca.crt; the role's probes keep
+# trusting ca.crt (the private CA of the node certificate), so the restart
+# and its readiness wait succeed. Then back to the scenario value.
+- name: "Behaviour: the probes keep ca.crt when the OS store is trusted too"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the running process before trusting the OS store
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Keep the main PID before trusting the OS store
+      ansible.builtin.set_fact:
+        __verify_pid_ca: "{{ __verify_proc_pid }}"
+
+    - name: Run the role with rustfs_tls_trust_system_ca
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_tls_trust_system_ca: true
+
+    - name: Read the running process with the OS store trusted
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the node restarted and the probes used ca.crt
+      ansible.builtin.assert:
+        that:
+          - __rustfs_restart_reasons == ['RUSTFS_TRUST_SYSTEM_CA']
+          - __verify_proc_pid | int != __verify_pid_ca | int
+          - __rustfs_probe_ca == '/etc/rustfs/tls/ca.crt'
+        fail_msg: >-
+          reasons {{ __rustfs_restart_reasons | default('unset') }}, main PID
+          {{ __verify_pid_ca }} -> {{ __verify_proc_pid }}, probe CA {{ __rustfs_probe_ca | default('unset') }}
+
+    - name: Run the role with the scenario value again
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+# The generated files used as operator-supplied material: the BYO checks
+# (owner and mode, validity, EKU, SAN, key match) pass on a running node
+# and nothing restarts.
+- name: "Behaviour: BYO mode accepts the material in place"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the running process before the BYO run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Keep the main PID before the BYO run
+      ansible.builtin.set_fact:
+        __verify_pid_byo: "{{ __verify_proc_pid }}"
+
+    - name: Run the role in BYO mode
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_tls_generate_certs: false
+
+    - name: Read the running process after the BYO run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the BYO run restarted nothing
+      ansible.builtin.assert:
+        that:
+          - not __rustfs_restart_needed
+          - __verify_proc_pid | int == __verify_pid_byo | int
+        fail_msg: "main PID {{ __verify_pid_byo }} -> {{ __verify_proc_pid }}, reasons {{ __rustfs_restart_reasons | default('unset') }}"
+
+# ------------------------------------------------------------------------------
+# Binary paths
+# ------------------------------------------------------------------------------
+
+# The kernel reports the canonical path of a running binary, so a
+# rustfs_bin_dir behind a symlink must still compare as the same binary:
+# one restart to move there, none on the next run. The copy there is the
+# verified binary with its digest file, so nothing is downloaded. Then the
+# digest file of the default binary is removed: the role no longer trusts
+# that binary, downloads and verifies it again and restarts onto it.
+- name: "Behaviour: a symlinked rustfs_bin_dir restarts once"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Create the real binary directory
+      ansible.builtin.file:
+        path: /opt/rustfs-bin-real
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Link the binary directory to it
+      ansible.builtin.file:
+        src: /opt/rustfs-bin-real
+        dest: /opt/rustfs-bin
+        state: link
+
+    - name: Copy the verified binary and its digest file there
+      ansible.builtin.copy:
+        src: "/usr/local/bin/{{ item['name'] }}"
+        dest: "/opt/rustfs-bin-real/{{ item['name'] }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "{{ item['mode'] }}"
+      loop:
+        - {name: rustfs-1.0.6-musl, mode: "0755"}
+        - {name: rustfs-1.0.6-musl.sha256, mode: "0644"}
+      loop_control:
+        label: "{{ item['name'] }}"
+
+    - name: Run the role with the symlinked binary directory
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_bin_dir: /opt/rustfs-bin
+
+    - name: Read the running process in the symlinked directory
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the node moved to the symlinked directory
+      ansible.builtin.assert:
+        that:
+          - __rustfs_restart_needed
+          - "'binary' in __rustfs_restart_reasons"
+          - __verify_proc_exe == '/opt/rustfs-bin-real/rustfs-1.0.6-musl'
+        fail_msg: "exe {{ __verify_proc_exe }}, reasons {{ __rustfs_restart_reasons | default('unset') }}"
+
+    - name: Keep the main PID in the symlinked directory
+      ansible.builtin.set_fact:
+        __verify_pid_bin: "{{ __verify_proc_pid }}"
+
+    - name: Run the role with the symlinked binary directory again
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_bin_dir: /opt/rustfs-bin
+
+    - name: Read the running process after the second run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the second run did not restart
+      ansible.builtin.assert:
+        that:
+          - not __rustfs_restart_needed
+          - __verify_proc_pid | int == __verify_pid_bin | int
+        fail_msg: "main PID {{ __verify_pid_bin }} -> {{ __verify_proc_pid }}, reasons {{ __rustfs_restart_reasons | default('unset') }}"
+
+    - name: Remove the digest file of the default versioned binary
+      ansible.builtin.file:
+        path: /usr/local/bin/rustfs-1.0.6-musl.sha256
+        state: absent
+
+    - name: Run the role with the default binary directory
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+    - name: Read the running process back in the default directory
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Stat the default versioned binary again
+      ansible.builtin.stat:
+        path: /usr/local/bin/rustfs-1.0.6-musl
+        checksum_algorithm: sha256
+      register: __verify_bin_after
+
+    - name: Read the new digest file
+      ansible.builtin.slurp:
+        src: /usr/local/bin/rustfs-1.0.6-musl.sha256
+      register: __verify_digest_after
+
+    # Only the download block writes the digest file. The verified binary
+    # equals the one on disk here, so copy leaves the file in place.
+    - name: Assert the untrusted binary was downloaded and verified again
+      ansible.builtin.assert:
+        that:
+          - (__verify_digest_after['content'] | b64decode | trim) == __verify_bin_after['stat']['checksum']
+          - __verify_proc_exe == '/usr/local/bin/rustfs-1.0.6-musl'
+          - "'binary' in __rustfs_restart_reasons"
+        fail_msg: >-
+          digest {{ __verify_digest_after['content'] | b64decode | trim }} vs
+          {{ __verify_bin_after['stat']['checksum'] }}, exe {{ __verify_proc_exe }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+    - name: Remove the symlinked binary directory
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/rustfs-bin
+        - /opt/rustfs-bin-real
+      loop_control:
+        label: "{{ item }}"
+
 # rustfs_service_state and rustfs_service_enabled (spec 10.1 play 4). The
-# first run also renders the default log level again (the interrupted
-# rollout play left "warn"); the service is stopped, so nothing restarts.
+# service is stopped, so nothing restarts.
 - name: "Behaviour: stopped and disabled, then back"
   hosts: all
   become: true
@@ -636,4 +1248,104 @@
       ansible.builtin.assert:
         that:
           - __verify_proc_env['RUSTFS_OBS_LOGGER_LEVEL'] == 'info'
+      no_log: true
+
+# README "Rotating secrets" (single node): a new rustfs_iam_master_key
+# without the running key in RUSTFS_IAM_MASTER_KEY_OLD_KEYS is refused
+# before anything changes (the IAM data encrypted with it would become
+# unreadable); with the old key listed it is a rolling restart. The play
+# then rotates back the same way and drops the old key, so the host ends in
+# the scenario state (the CI check-mode converge runs against it).
+- name: "Behaviour: an IAM master key change must keep the old key"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_iam_key_1: "molecule-iam-master-key-0123456789"
+    __verify_iam_key_2: "molecule-iam-master-key-rotated-0123456789"
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_iam_master_key: "{{ __verify_iam_key_2 }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role dropped the running IAM master key"
+      rescue:
+        - name: Check the refusal names the problem
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs-default: old key dropped"
+            __verify_secret: "{{ __verify_iam_key_1 }}"
+
+        - name: Check the refusal does not show the new key
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "RUSTFS_IAM_MASTER_KEY_OLD_KEYS"
+            __verify_secret: "{{ __verify_iam_key_2 }}"
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refusal changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    - name: Run the role with the new key and the old key listed
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_iam_master_key: "{{ __verify_iam_key_2 }}"
+        rustfs_extra_secret_env:
+          RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ __verify_iam_key_1 }}"
+
+    - name: Read the running process with the new key
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the node restarted in the rolling path with both keys
+      ansible.builtin.assert:
+        that:
+          - __rustfs_restart_needed
+          - not __rustfs_restart_together
+          - "'RUSTFS_IAM_MASTER_KEY' in __rustfs_restart_reasons"
+          - __verify_proc_pid | int != __verify_state_before['main_pid'] | int
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY'] == __verify_iam_key_2
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY_OLD_KEYS'] == __verify_iam_key_1
+        fail_msg: "reasons {{ __rustfs_restart_reasons | default('unset') }}"
+      no_log: true
+
+    - name: Rotate back with the new key listed
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_extra_secret_env:
+          RUSTFS_IAM_MASTER_KEY_OLD_KEYS: "{{ __verify_iam_key_2 }}"
+
+    # Dropping an old key is not a change of the current key.
+    - name: Run the role with the scenario variables again
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+    - name: Read the running process in the scenario state
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the node runs the scenario key without old keys
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_env['RUSTFS_IAM_MASTER_KEY'] == __verify_iam_key_1
+          - "'RUSTFS_IAM_MASTER_KEY_OLD_KEYS' not in __verify_proc_env"
+        fail_msg: "the node does not run the scenario IAM master key"
       no_log: true
