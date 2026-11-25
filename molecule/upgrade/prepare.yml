@@ -1,8 +1,7 @@
 ---
 # Prepare the upgrade container before the role runs.
-# Bootstraps Python (plus curl for the S3 requests of side_effect and
-# verify). Nothing RustFS-specific: the role creates the user, installs its
-# package dependencies and the binaries itself.
+# Bootstraps Python. Nothing RustFS-specific: the role creates the user,
+# installs its package dependencies and the binaries itself.
 
 - name: Prepare upgrade container
   hosts: all
@@ -13,18 +12,14 @@
       register: __verify_pkg_mgr
       changed_when: false
 
-    - name: Bootstrap Python and test tools (Debian/Ubuntu)
+    - name: Bootstrap Python (Debian/Ubuntu)
       ansible.builtin.raw: >-
         apt-get update -qq &&
-        apt-get install -y -qq --no-install-recommends python3 python3-apt curl
+        apt-get install -y -qq --no-install-recommends python3 python3-apt
       changed_when: true
       when: "'apt' in __verify_pkg_mgr['stdout']"
 
-    # EL images ship curl-minimal, which conflicts with the curl package and
-    # already provides /usr/bin/curl.
-    - name: Bootstrap Python and test tools (RHEL/Rocky)
-      ansible.builtin.raw: >-
-        dnf install -y python3 &&
-        { command -v curl >/dev/null 2>&1 || dnf install -y curl; }
+    - name: Bootstrap Python (RHEL/Rocky)
+      ansible.builtin.raw: dnf install -y python3
       changed_when: true
       when: "'dnf' in __verify_pkg_mgr['stdout']"

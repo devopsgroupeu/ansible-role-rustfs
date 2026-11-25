@@ -47,20 +47,24 @@
         url: "{{ __verify_url }}/health/ready"
       register: __verify_ready
 
+    # The SigV4 helper of molecule/shared/files (the curl 7.76.1 of EL 9 signs
+    # requests RustFS rejects). The credentials go in on stdin, never in argv.
+    - name: Copy the S3 SigV4 helper
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../shared/files/s3_sigv4.py"
+        dest: /root/molecule-s3-sigv4.py
+        owner: root
+        group: root
+        mode: "0644"
+
     - name: Download the object written before the upgrade
       ansible.builtin.command:
         argv:
-          - curl
-          - --silent
-          - --show-error
-          - --fail
-          - --aws-sigv4
-          - "aws:amz:us-east-1:s3"
-          - --user
-          - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
-          - -H
-          - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+          - /usr/bin/python3
+          - /root/molecule-s3-sigv4.py
+          - GET
           - "{{ __verify_url }}/molecule-bucket/object.txt"
+        stdin: "{{ {'access_key': rustfs_access_key, 'secret_key': rustfs_secret_key} | to_json }}"
       register: __verify_get
       changed_when: false
       no_log: true

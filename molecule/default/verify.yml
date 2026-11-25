@@ -212,20 +212,15 @@
     __verify_ca: /etc/rustfs/tls/ca.crt
     # The secret of molecule.yml as Ansible must receive it.
     __verify_secret_key: 'molecule-secret $#''key-0123456789'
-    # argv of every signed S3 request (curl SigV4). The explicit
-    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
-    __verify_s3_curl:
-      - curl
-      - --silent
-      - --show-error
+    # argv of every signed S3 request: the SigV4 helper of
+    # molecule/shared/files (the curl 7.76.1 of EL 9 signs requests RustFS
+    # rejects). The credentials go in on stdin, never in argv.
+    __verify_s3_cmd:
+      - /usr/bin/python3
+      - /root/molecule-s3-sigv4.py
       - --cacert
       - "{{ __verify_ca }}"
-      - --aws-sigv4
-      - "aws:amz:us-east-1:s3"
-      - --user
-      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
-      - -H
-      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+    __verify_s3_credentials: "{{ {'access_key': rustfs_access_key, 'secret_key': rustfs_secret_key} | to_json }}"
   tasks:
     - name: Gather service facts
       ansible.builtin.service_facts:
@@ -289,12 +284,19 @@
         group: root
         mode: "0600"
 
+    - name: Copy the S3 SigV4 helper
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../shared/files/s3_sigv4.py"
+        dest: /root/molecule-s3-sigv4.py
+        owner: root
+        group: root
+        mode: "0644"
+
     # 409 when an earlier verify run created it already.
     - name: Create the test bucket over S3
       ansible.builtin.command:
-        argv: >-
-          {{ __verify_s3_curl + ['--output', '/dev/null', '--write-out', '%{http_code}',
-                                 '-X', 'PUT', __verify_url ~ '/molecule-bucket'] }}
+        argv: "{{ __verify_s3_cmd + ['--status', 'PUT', __verify_url ~ '/molecule-bucket'] }}"
+        stdin: "{{ __verify_s3_credentials }}"
       register: __verify_bucket
       changed_when: false
       no_log: true
@@ -302,14 +304,16 @@
     - name: Upload the test object over S3
       ansible.builtin.command:
         argv: >-
-          {{ __verify_s3_curl + ['--fail', '--upload-file', '/root/molecule-object.txt',
-                                 __verify_url ~ '/molecule-bucket/object.txt'] }}
+          {{ __verify_s3_cmd + ['--upload', '/root/molecule-object.txt',
+                                'PUT', __verify_url ~ '/molecule-bucket/object.txt'] }}
+        stdin: "{{ __verify_s3_credentials }}"
       changed_when: false
       no_log: true
 
     - name: Download the test object over S3
       ansible.builtin.command:
-        argv: "{{ __verify_s3_curl + ['--fail', __verify_url ~ '/molecule-bucket/object.txt'] }}"
+        argv: "{{ __verify_s3_cmd + ['GET', __verify_url ~ '/molecule-bucket/object.txt'] }}"
+        stdin: "{{ __verify_s3_credentials }}"
       register: __verify_get
       changed_when: false
       no_log: true

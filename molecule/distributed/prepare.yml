@@ -1,9 +1,8 @@
 ---
 # Prepare the four distributed containers before the role runs.
-# Play 1 bootstraps Python plus curl (S3 requests in side_effect and verify)
-# and openssl (certificate check in verify), and mounts a tmpfs at each data
-# dir. Nothing RustFS-specific: the role creates the user, installs its
-# package dependencies and the binary.
+# Play 1 bootstraps Python plus openssl (certificate check in verify), and
+# mounts a tmpfs at each data dir. Nothing RustFS-specific: the role creates
+# the user, installs its package dependencies and the binary.
 # Plays 2 and 3 test preflight P7 while the hosts are still empty: a first
 # bootstrap that runs on three of the four cluster hosts must be refused
 # before anything is written, so no host has an env file afterwards.
@@ -20,16 +19,12 @@
     - name: Bootstrap Python and test tools (Debian/Ubuntu)
       ansible.builtin.raw: >-
         apt-get update -qq &&
-        apt-get install -y -qq --no-install-recommends python3 python3-apt curl openssl
+        apt-get install -y -qq --no-install-recommends python3 python3-apt openssl
       changed_when: true
       when: "'apt' in __verify_pkg_mgr['stdout']"
 
-    # EL images ship curl-minimal, which conflicts with the curl package and
-    # already provides /usr/bin/curl.
     - name: Bootstrap Python and test tools (RHEL/Rocky)
-      ansible.builtin.raw: >-
-        dnf install -y python3 openssl &&
-        { command -v curl >/dev/null 2>&1 || dnf install -y curl; }
+      ansible.builtin.raw: dnf install -y python3 openssl
       changed_when: true
       when: "'dnf' in __verify_pkg_mgr['stdout']"
 

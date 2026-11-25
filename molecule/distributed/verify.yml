@@ -24,21 +24,15 @@
     __verify_role_dir: "{{ playbook_dir }}/../.."
     __verify_url: "https://{{ inventory_hostname }}:9000"
     __verify_ca: /etc/rustfs/tls/ca.crt
-    # argv of every signed S3 request (curl SigV4). The explicit
-    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
-    __verify_s3_curl:
-      - curl
-      - --silent
-      - --show-error
-      - --fail
+    # argv of every signed S3 request: the SigV4 helper of
+    # molecule/shared/files (the curl 7.76.1 of EL 9 signs requests RustFS
+    # rejects). The credentials go in on stdin, never in argv.
+    __verify_s3_cmd:
+      - /usr/bin/python3
+      - /root/molecule-s3-sigv4.py
       - --cacert
       - "{{ __verify_ca }}"
-      - --aws-sigv4
-      - "aws:amz:us-east-1:s3"
-      - --user
-      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
-      - -H
-      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+    __verify_s3_credentials: "{{ {'access_key': rustfs_access_key, 'secret_key': rustfs_secret_key} | to_json }}"
   tasks:
     # Read from the role's defaults, so a version bump needs no change here.
     - name: Read the default version of the role
@@ -136,11 +130,20 @@
           ({{ __verify_openssl['stdout'] }} {{ __verify_openssl['stderr'] }}), CA checksums
           {{ ansible_play_hosts | map('extract', hostvars, ['__verify_ca_stat', 'stat', 'checksum']) | list }}
 
+    - name: Copy the S3 SigV4 helper
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../shared/files/s3_sigv4.py"
+        dest: /root/molecule-s3-sigv4.py
+        owner: root
+        group: root
+        mode: "0644"
+
     # The object side_effect.yml wrote through rustfs-node1 before both
     # restart phases.
     - name: Download the side effect object through this node
       ansible.builtin.command:
-        argv: "{{ __verify_s3_curl + [__verify_url ~ '/molecule-bucket/object.txt'] }}"
+        argv: "{{ __verify_s3_cmd + ['GET', __verify_url ~ '/molecule-bucket/object.txt'] }}"
+        stdin: "{{ __verify_s3_credentials }}"
       register: __verify_get_side_effect
       changed_when: false
       no_log: true
@@ -157,15 +160,17 @@
     - name: Upload the verify object through rustfs-node1
       ansible.builtin.command:
         argv: >-
-          {{ __verify_s3_curl + ['--upload-file', '/root/molecule-verify.txt',
-                                 __verify_url ~ '/molecule-bucket/verify.txt'] }}
+          {{ __verify_s3_cmd + ['--upload', '/root/molecule-verify.txt',
+                                'PUT', __verify_url ~ '/molecule-bucket/verify.txt'] }}
+        stdin: "{{ __verify_s3_credentials }}"
       changed_when: false
       no_log: true
       when: inventory_hostname == 'rustfs-node1'
 
     - name: Download the verify object through rustfs-node4
       ansible.builtin.command:
-        argv: "{{ __verify_s3_curl + [__verify_url ~ '/molecule-bucket/verify.txt'] }}"
+        argv: "{{ __verify_s3_cmd + ['GET', __verify_url ~ '/molecule-bucket/verify.txt'] }}"
+        stdin: "{{ __verify_s3_credentials }}"
       register: __verify_get_verify
       changed_when: false
       no_log: true

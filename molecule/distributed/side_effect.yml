@@ -21,20 +21,15 @@
   vars:
     __verify_url: "https://{{ inventory_hostname }}:9000"
     __verify_ca: /etc/rustfs/tls/ca.crt
-    # argv of every signed S3 request (curl SigV4). The explicit
-    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
-    __verify_s3_curl:
-      - curl
-      - --silent
-      - --show-error
+    # argv of every signed S3 request: the SigV4 helper of
+    # molecule/shared/files (the curl 7.76.1 of EL 9 signs requests RustFS
+    # rejects). The credentials go in on stdin, never in argv.
+    __verify_s3_cmd:
+      - /usr/bin/python3
+      - /root/molecule-s3-sigv4.py
       - --cacert
       - "{{ __verify_ca }}"
-      - --aws-sigv4
-      - "aws:amz:us-east-1:s3"
-      - --user
-      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
-      - -H
-      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+    __verify_s3_credentials: "{{ {'access_key': rustfs_access_key, 'secret_key': rustfs_secret_key} | to_json }}"
   tasks:
     # --------------------------------------------------------------------------
     # Step 1: write the test object through rustfs-node1, record the baseline
@@ -49,12 +44,20 @@
         mode: "0600"
       when: inventory_hostname == 'rustfs-node1'
 
+    - name: Copy the S3 SigV4 helper to rustfs-node1
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../shared/files/s3_sigv4.py"
+        dest: /root/molecule-s3-sigv4.py
+        owner: root
+        group: root
+        mode: "0644"
+      when: inventory_hostname == 'rustfs-node1'
+
     # 409 when an earlier side_effect run created it already.
     - name: Create the test bucket through rustfs-node1
       ansible.builtin.command:
-        argv: >-
-          {{ __verify_s3_curl + ['--output', '/dev/null', '--write-out', '%{http_code}',
-                                 '-X', 'PUT', __verify_url ~ '/molecule-bucket'] }}
+        argv: "{{ __verify_s3_cmd + ['--status', 'PUT', __verify_url ~ '/molecule-bucket'] }}"
+        stdin: "{{ __verify_s3_credentials }}"
       register: __verify_bucket
       changed_when: false
       no_log: true
@@ -71,8 +74,9 @@
     - name: Upload the test object through rustfs-node1
       ansible.builtin.command:
         argv: >-
-          {{ __verify_s3_curl + ['--fail', '--upload-file', '/root/molecule-distributed.txt',
-                                 __verify_url ~ '/molecule-bucket/object.txt'] }}
+          {{ __verify_s3_cmd + ['--upload', '/root/molecule-distributed.txt',
+                                'PUT', __verify_url ~ '/molecule-bucket/object.txt'] }}
+        stdin: "{{ __verify_s3_credentials }}"
       changed_when: false
       no_log: true
       when: inventory_hostname == 'rustfs-node1'
