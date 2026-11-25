@@ -1,4 +1,8 @@
 profile: production
+# Molecule playbooks include the role by its checkout directory name, which
+# ansible-lint >= 26.11 no longer resolves on its own.
+mock_roles:
+  - ansible-role-rustfs
 exclude_paths:
   - .github/
   - .ansible-lint
