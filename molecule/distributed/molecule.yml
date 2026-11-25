@@ -15,9 +15,11 @@
 # all four nodes; side_effect.yml rolls a log level change node by node,
 # then restarts all nodes together for a new RPC secret; verify.yml checks
 # the cluster, the derived defaults (also as under --limit), and that
-# serial, the free strategy, inconsistent cluster variables, a dead peer, an
-# offline drive and a one-step IAM master key rotation are refused, then
-# replaces the drive and rotates the IAM master key in two runs.
+# serial, the free strategy, inconsistent cluster variables, a new RPC
+# secret while a node fails after preflight, a dead peer and an offline
+# drive are refused, replaces the drive, refuses a rolling restart while a
+# drive is still healing, refuses a one-step IAM master key rotation and
+# rotates the key in two runs.
 #
 # Resources: each RustFS process peaked at about 130 MB resident memory
 # during the restarts (Debian 12, arm64), so the four containers need well
@@ -114,9 +116,9 @@ provisioner:
         # and a node certificate per node.
         rustfs_tls_generate_certs: true
         # The data dirs are tmpfs mounts (prepare), so
-        # rustfs_require_mounted_drives keeps its default. Container: the
-        # tmpfs drives are not physical disks.
-        rustfs_unsafe_bypass_disk_check: true
+        # rustfs_require_mounted_drives keeps its default, and so does the
+        # distinct-disk check of RustFS: each tmpfs has a device number of
+        # its own.
         # Container: while a behaviour play has a tmpfs unmounted, that data
         # dir sits on the overlayfs root filesystem, which "fail" refuses
         # (tmpfs itself is supported).

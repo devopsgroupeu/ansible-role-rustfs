@@ -58,8 +58,9 @@ provisioner:
         # One extra writable path for the systemd sandbox (created in prepare).
         rustfs_systemd_read_write_paths:
           - "/var/lib/rustfs-extra"
-        # Container: the tmpfs drives are not physical disks.
-        rustfs_unsafe_bypass_disk_check: true
+        # The distinct-disk check of RustFS stays on (the role default): each
+        # tmpfs drive has a device number of its own, and the directory below
+        # an unmounted drive sits on the root filesystem, as on a real host.
         # Container: while a behaviour play has a tmpfs unmounted, that data
         # dir sits on the overlayfs root filesystem, which "fail" refuses
         # (tmpfs itself is supported).

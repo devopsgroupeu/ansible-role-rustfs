@@ -8,11 +8,14 @@
 # special-character secret. The behaviour plays then re-run the role: an
 # interrupted rollout restarts exactly once (under a proxy environment the
 # probes ignore), the stage tags of a static role converge, an unmounted
-# drive is refused by the role but not by the unit and a new drive is taken
-# in, two guards refuse and leave the host untouched (main PID, symlink
-# target, env file), a rejected certificate reload restarts the node and an
-# accepted one does not, the probes keep ca.crt with the OS store trusted
-# too, BYO mode accepts the material in place, a symlinked rustfs_bin_dir
+# drive is refused by the role but not by the unit, a second one stops the
+# node (distinct-disk check), and new drives are taken in, two guards refuse
+# and leave the host untouched (main PID, symlink target, env file), a
+# rejected certificate reload restarts the node and an accepted one does
+# not, the probes keep ca.crt with the OS store trusted too and use the OS
+# store when ca.crt does not sign the node certificate, a certificate no
+# trusted CA signs is refused before the restart, BYO mode accepts the
+# material in place, a symlinked rustfs_bin_dir
 # restarts once and a binary without its digest is installed again, the
 # service can be stopped and disabled and brought back, and an IAM master
 # key change must keep the old key.
@@ -128,7 +131,8 @@
         that:
           - "'RUSTFS_VOLUMES=\"/data/rustfs{0...3}\"' in __verify_env"
           - "'RUSTFS_TLS_PATH=\"/etc/rustfs/tls\"' in __verify_env"
-          - "'RUSTFS_UNSAFE_BYPASS_DISK_CHECK=\"true\"' in __verify_env"
+          # The distinct-disk check of RustFS stays on.
+          - "'RUSTFS_UNSAFE_BYPASS_DISK_CHECK' not in __verify_env"
           - "'RUSTFS_UNSUPPORTED_FS_POLICY=\"warn\"' in __verify_env"
           - "'ExecStart=/usr/local/bin/rustfs server' in __verify_unit"
           - "'ReadWritePaths=/opt/rustfs /data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3 /var/lib/rustfs-extra' in __verify_unit"
@@ -551,10 +555,12 @@
 # pulled disk): the role refuses to run, because it would set the owner of
 # the directory below the mount, but the unit still starts and RustFS
 # serves on the other drives without writing to that root-owned directory.
-# A new, empty drive at the same path is taken in the documented way
-# (README, "Drives and reboots"): a restart by hand makes the new mount
-# visible to RustFS, the role run then sets the owner of the new
-# filesystem, and RustFS formats and heals it by itself.
+# A second unmounted drive is the limit of that: both directories sit on the
+# root filesystem, and the distinct-disk check of RustFS refuses the start.
+# New, empty drives at both paths are taken in the documented way (README,
+# "Drives and reboots"): a restart by hand makes the new mounts visible to
+# RustFS, the role run then sets the owner of the new filesystems, and
+# RustFS formats and heals them by itself (four drives, parity 2).
 - name: "Behaviour: an unmounted drive is one offline drive"
   hosts: all
   become: true
@@ -653,21 +659,60 @@
           {{ __verify_bare_dir['stat']['pw_name'] }} {{ __verify_bare_dir['stat']['mode'] }},
           files {{ __verify_bare_files['files'] | map(attribute='path') | list }}
 
-    - name: Mount a new empty drive at /data/rustfs3
+    - name: Stop RustFS before a second drive goes
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: stopped
+
+    - name: Unmount the drive /data/rustfs2 too
+      ansible.builtin.command: umount /data/rustfs2
+      changed_when: true
+
+    - name: Start the unit without two drives
+      ansible.builtin.systemd_service:
+        name: rustfs
+        state: started
+        no_block: true
+
+    # Exits at once and is restarted every 10 s: the node is down.
+    - name: Wait for the distinct-disk refusal in the journal
+      ansible.builtin.command: journalctl -u rustfs --no-pager --since "-60s"
+      register: __verify_two_journal
+      until: "'local erasure endpoints must use distinct physical disks' in __verify_two_journal['stdout']"
+      retries: 15
+      delay: 2
+      changed_when: false
+
+    - name: Probe /health/ready without two drives
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+        ca_path: "{{ __verify_ca }}"
+      register: __verify_two_down
+      failed_when: false
+
+    - name: Assert two unmounted drives stop the node
+      ansible.builtin.assert:
+        that:
+          - __verify_two_down['status'] == -1
+          - "'/data/rustfs2, /data/rustfs3' in __verify_two_journal['stdout']"
+        fail_msg: "readiness {{ __verify_two_down['status'] }}; journal does not name both drives"
+
+    - name: Mount new empty drives at /data/rustfs2 and /data/rustfs3
       ansible.builtin.include_tasks: ../shared/tasks/mount_drives.yml
       vars:
-        __verify_drives: [/data/rustfs3]
+        __verify_drives: [/data/rustfs2, /data/rustfs3]
 
     # A filesystem mounted after the start is not visible in the namespace
-    # of the running process.
-    - name: Restart RustFS to see the new mount
+    # of the running process (here the unit is between two failed starts).
+    - name: Restart RustFS to see the new mounts
       ansible.builtin.systemd_service:
         name: rustfs
         state: restarted
         no_block: true
 
-    # The new filesystem root is root:root, so RustFS cannot use it yet.
-    - name: Wait until the node is ready again, still without the drive
+    # The new filesystem roots are root:root, so RustFS cannot use them yet.
+    # Two of four drives keep read quorum (ready), not write quorum.
+    - name: Wait until the node is ready again, still without the drives
       ansible.builtin.uri:
         url: "{{ __verify_url }}/health/ready"
         ca_path: "{{ __verify_ca }}"
@@ -676,7 +721,7 @@
       until: >-
         __verify_remounted['status'] == 200
         and (__verify_remounted['json']['details']['storage']['unavailableDrives']
-             + __verify_remounted['json']['details']['storage']['missingDrives']) | length == 1
+             + __verify_remounted['json']['details']['storage']['missingDrives']) | length == 2
       retries: 30
       delay: 2
 
@@ -687,20 +732,24 @@
       ansible.builtin.set_fact:
         __verify_pid_degraded: "{{ __verify_proc_pid }}"
 
-    - name: Run the role with the new drive
+    # Its write-quorum wait passes once RustFS has taken in the drives.
+    - name: Run the role with the new drives
       ansible.builtin.include_role:
         name: ansible-role-rustfs
 
     - name: Read the running process after the role run
       ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
 
-    - name: Stat the new drive
+    - name: Stat the new drives
       ansible.builtin.stat:
-        path: /data/rustfs3
+        path: "{{ item }}"
         get_checksum: false
-      register: __verify_new_drive
+      loop: [/data/rustfs2, /data/rustfs3]
+      loop_control:
+        label: "{{ item }}"
+      register: __verify_new_drives
 
-    # RustFS notices the writable drive by itself, formats and heals it.
+    # RustFS notices the writable drives by itself, formats and heals them.
     - name: Wait until RustFS lists every drive online
       ansible.builtin.uri:
         url: "{{ __verify_url }}/health/ready"
@@ -714,17 +763,22 @@
       retries: 30
       delay: 2
 
-    - name: Assert the role took in the new drive without a restart
+    - name: Assert the role took in the new drives without a restart
+      vars:
+        __verify_new_owners: >-
+          {{ __verify_new_drives['results'] | map(attribute='stat') | map(attribute='pw_name') | list }}
+        __verify_new_modes: >-
+          {{ __verify_new_drives['results'] | map(attribute='stat') | map(attribute='mode') | list }}
       ansible.builtin.assert:
         that:
-          - __verify_new_drive['stat']['pw_name'] == 'rustfs'
-          - __verify_new_drive['stat']['mode'] == '0750'
+          - __verify_new_owners == ['rustfs', 'rustfs']
+          - __verify_new_modes == ['0750', '0750']
           - __verify_proc_pid | int == __verify_pid_degraded | int
           - not __rustfs_restart_needed
           - __verify_healed['json']['details']['storage']['unavailableDrives'] == []
           - __verify_healed['json']['details']['storage']['missingDrives'] == []
         fail_msg: >-
-          new drive {{ __verify_new_drive['stat']['pw_name'] }} {{ __verify_new_drive['stat']['mode'] }},
+          new drives {{ __verify_new_owners }} {{ __verify_new_modes }},
           main PID {{ __verify_pid_degraded }} -> {{ __verify_proc_pid }},
           ready {{ __verify_healed['json'] }}
 
@@ -1029,6 +1083,235 @@
     - name: Run the role with the scenario value again
       ansible.builtin.include_role:
         name: ansible-role-rustfs
+
+# The other combination: a node certificate from a CA in the OS store (a
+# public CA) and a ca.crt that did not sign it (a private CA for outbound
+# targets). RustFS trusts both stores with rustfs_tls_trust_system_ca, so the
+# probes must use the OS store, not ca.crt. Without the OS store the same
+# certificate is refused before any restart. The generated material and the
+# OS store are restored at the end.
+- name: "Behaviour: the probes use the OS store when ca.crt does not sign the node certificate"
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    __verify_os_ca_dir: /root/molecule-os-ca
+    __verify_os_anchor: >-
+      {{ '/usr/local/share/ca-certificates/molecule-os-ca.crt' if ansible_facts['os_family'] == 'Debian'
+         else '/etc/pki/ca-trust/source/anchors/molecule-os-ca.crt' }}
+    __verify_os_update: >-
+      {{ ['update-ca-certificates', '--fresh'] if ansible_facts['os_family'] == 'Debian'
+         else ['update-ca-trust', 'extract'] }}
+  tasks:
+    - name: Create the directory of the OS store test CA
+      ansible.builtin.file:
+        path: "{{ __verify_os_ca_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Keep the generated node certificate and key
+      ansible.builtin.copy:
+        src: "/etc/rustfs/tls/{{ item }}"
+        dest: "{{ __verify_os_ca_dir }}/generated-{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      loop: [rustfs_cert.pem, rustfs_key.pem]
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Create the key of the OS store test CA
+      community.crypto.openssl_privatekey:
+        path: "{{ __verify_os_ca_dir }}/ca.key"
+        type: ECC
+        curve: secp384r1
+        mode: "0600"
+
+    - name: Create the CSR of the OS store test CA
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ __verify_os_ca_dir }}/ca.key"
+        common_name: "Molecule OS Store CA"
+        use_common_name_for_san: false
+        basic_constraints:
+          - "CA:TRUE"
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+          - cRLSign
+        key_usage_critical: true
+      register: __verify_os_ca_csr
+      changed_when: false
+
+    - name: Self-sign the OS store test CA
+      community.crypto.x509_certificate:
+        path: "{{ __verify_os_ca_dir }}/ca.crt"
+        csr_content: "{{ __verify_os_ca_csr['csr'] }}"
+        privatekey_path: "{{ __verify_os_ca_dir }}/ca.key"
+        provider: selfsigned
+        mode: "0644"
+
+    - name: Add the test CA to the OS store
+      ansible.builtin.copy:
+        src: "{{ __verify_os_ca_dir }}/ca.crt"
+        dest: "{{ __verify_os_anchor }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Rebuild the OS store with the test CA
+      ansible.builtin.command:
+        argv: "{{ __verify_os_update }}"
+      changed_when: true
+
+    - name: Create a node key for the OS store test CA
+      community.crypto.openssl_privatekey:
+        path: "{{ __verify_os_ca_dir }}/node.key"
+        type: ECC
+        curve: secp384r1
+        mode: "0600"
+
+    # The names of the generated certificate, so RustFS accepts the reload.
+    - name: Create a node CSR for the OS store test CA
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "{{ __verify_os_ca_dir }}/node.key"
+        common_name: localhost
+        subject_alt_name:
+          - "DNS:localhost"
+          - "DNS:{{ inventory_hostname }}"
+          - "IP:127.0.0.1"
+          - "DNS:rustfs.molecule.test"
+        use_common_name_for_san: false
+        extended_key_usage:
+          - serverAuth
+      register: __verify_os_node_csr
+      changed_when: false
+
+    - name: Issue the node certificate from the OS store test CA
+      community.crypto.x509_certificate:
+        path: "{{ __verify_os_ca_dir }}/node.crt"
+        csr_content: "{{ __verify_os_node_csr['csr'] }}"
+        provider: ownca
+        ownca_path: "{{ __verify_os_ca_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ __verify_os_ca_dir }}/ca.key"
+        mode: "0644"
+
+    # ca.crt stays the generated CA, which did not sign this certificate.
+    - name: Place the node certificate of the OS store test CA
+      ansible.builtin.copy:
+        src: "{{ __verify_os_ca_dir }}/{{ item['src'] }}"
+        dest: "/etc/rustfs/tls/{{ item['dest'] }}"
+        remote_src: true
+        owner: root
+        group: "{{ item['group'] }}"
+        mode: "{{ item['mode'] }}"
+      loop:
+        - {src: node.crt, dest: rustfs_cert.pem, group: root, mode: "0644"}
+        - {src: node.key, dest: rustfs_key.pem, group: rustfs, mode: "0640"}
+      loop_control:
+        label: "{{ item['dest'] }}"
+
+    - name: Read the running process before the OS store run
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Keep the main PID before the OS store run
+      ansible.builtin.set_fact:
+        __verify_pid_os: "{{ __verify_proc_pid }}"
+
+    - name: Run the role in BYO mode with rustfs_tls_trust_system_ca
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_tls_generate_certs: false
+        rustfs_tls_trust_system_ca: true
+
+    - name: Read the running process with the OS store trusted
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the node restarted and the probes used the OS store
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_TRUST_SYSTEM_CA' in __rustfs_restart_reasons"
+          - __verify_proc_pid | int != __verify_pid_os | int
+          - __rustfs_probe_ca == ''
+        fail_msg: >-
+          reasons {{ __rustfs_restart_reasons | default('unset') }}, main PID
+          {{ __verify_pid_os }} -> {{ __verify_proc_pid }}, probe CA {{ __rustfs_probe_ca | default('unset') }}
+
+    - name: Keep the main PID with the OS store trusted
+      ansible.builtin.set_fact:
+        __verify_pid_os: "{{ __verify_proc_pid }}"
+
+    - name: Run the role without the OS store expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_tls_generate_certs: false
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a node certificate that ca.crt does not sign"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: >-
+              The certificate /etc/rustfs/tls/rustfs_cert.pem of {{ inventory_hostname }}
+              chains to none of the CA stores RustFS trusts here (/etc/rustfs/tls/ca.crt)
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Read the running process after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Assert the refusal restarted nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_pid | int == __verify_pid_os | int
+        fail_msg: "main PID {{ __verify_pid_os }} -> {{ __verify_proc_pid }}"
+
+    - name: Put the generated node certificate and key back
+      ansible.builtin.copy:
+        src: "{{ __verify_os_ca_dir }}/generated-{{ item['name'] }}"
+        dest: "/etc/rustfs/tls/{{ item['name'] }}"
+        remote_src: true
+        owner: root
+        group: "{{ item['group'] }}"
+        mode: "{{ item['mode'] }}"
+      loop:
+        - {name: rustfs_cert.pem, group: root, mode: "0644"}
+        - {name: rustfs_key.pem, group: rustfs, mode: "0640"}
+      loop_control:
+        label: "{{ item['name'] }}"
+
+    - name: Remove the test CA from the OS store
+      ansible.builtin.file:
+        path: "{{ __verify_os_anchor }}"
+        state: absent
+
+    - name: Rebuild the OS store without the test CA
+      ansible.builtin.command:
+        argv: "{{ __verify_os_update }}"
+      changed_when: true
+
+    - name: Remove the files of the OS store test CA
+      ansible.builtin.file:
+        path: "{{ __verify_os_ca_dir }}"
+        state: absent
+
+    - name: Run the role with the scenario values again
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+
+    - name: Assert the probes use ca.crt again
+      ansible.builtin.assert:
+        that:
+          - __rustfs_probe_ca == '/etc/rustfs/tls/ca.crt'
+        fail_msg: "probe CA {{ __rustfs_probe_ca | default('unset') }}"
 
 # The generated files used as operator-supplied material: the BYO checks
 # (owner and mode, validity, EKU, SAN, key match) pass on a running node

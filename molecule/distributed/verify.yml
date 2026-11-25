@@ -7,9 +7,12 @@
 # by every node, and objects readable through every node. Play 2 checks the
 # derived defaults (rustfs_cluster_hosts, rustfs_node_address). The
 # behaviour plays then re-run the role: serial and inconsistent cluster
-# variables are refused before anything changes, a dead peer stops the
+# variables are refused before anything changes, a new RPC secret is refused
+# under --limit and when a node fails after preflight, a dead peer stops the
 # rolling restart before the first node goes down (Review Focus 4), and a
-# run on the whole cluster starts the dead node and rolls the others.
+# run on the whole cluster starts the dead node and rolls the others. An
+# offline drive and then a drive that is still healing (on a host outside
+# the play) stop the rolling restart too.
 # Every play that runs the role passes the phase 2 RPC secret
 # (__molecule_rotated_rpc_secret) and the log level it expects.
 
@@ -343,6 +346,82 @@
     - name: Assert the refusal changed nothing
       ansible.builtin.assert:
         that:
+          - __verify_state == __verify_state_before
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+# The same change on the whole cluster, but rustfs-node4 fails after
+# preflight (an invalid extra SAN breaks its certificate request in the tls
+# stage, after the config stage rendered the new secret). The other nodes
+# must not restart together with the new RPC secret without it: they refuse
+# right before the restart. The next run with the current secret renders
+# the files back and restarts nothing.
+- name: "Behaviour: a cluster-wide change is refused when a host fails after preflight"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "molecule-rpc-secret-canary-0123456789"
+            rustfs_tls_extra_sans: "{{ ['IP:not-an-address'] if inventory_hostname == 'rustfs-node4' else [] }}"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role changed the RPC secret while rustfs-node4 failed"
+      rescue:
+        - name: Check the failure of rustfs-node4 in the tls stage
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_task['name'] == 'Create the node CSR'
+            fail_msg: "rustfs-node4 failed at {{ ansible_failed_task['name'] }}: {{ ansible_failed_result['msg'] | default('') }}"
+          when: inventory_hostname == 'rustfs-node4'
+
+        - name: Check the refusal of the other nodes
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: >-
+              RUSTFS_RPC_SECRET change on {{ inventory_hostname }}, but the cluster hosts
+              ['rustfs-node4'] passed preflight and then failed in this run
+            __verify_secret: "molecule-rpc-secret-canary-0123456789"
+          when: inventory_hostname != 'rustfs-node4'
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert no node was restarted
+      ansible.builtin.assert:
+        that:
+          - __verify_state['main_pid'] == __verify_state_before['main_pid']
+          - __verify_state['main_pid'] | int > 0
+          - __verify_state['link_target'] == __verify_state_before['link_target']
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    - name: Run the role with the current RPC secret
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_log_level: "warn"
+        rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+
+    - name: Record the host state after the run
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the run restored the files and restarted nothing
+      ansible.builtin.assert:
+        that:
+          - not __rustfs_restart_needed
           - __verify_state == __verify_state_before
         fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
 
@@ -839,6 +918,90 @@
         and __verify_healed['json']['details']['storage']['missingDrives'] == []
       retries: 60
       delay: 2
+
+# A replaced drive leaves the drive lists before RustFS has rebuilt it, and
+# /health/ready does not show the heal; RustFS keeps
+# <drive>/.rustfs.sys/healing.bin while it runs. The heal of the near-empty
+# test drive ends in seconds, so a marker is placed by hand on rustfs-node3,
+# a host outside this play (as under --limit): the rolling restart of
+# rustfs-node1 must wait for it and then refuse. The marker is removed
+# afterwards.
+- name: "Behaviour: a drive that is still healing refuses the rolling restart"
+  hosts: rustfs-node1
+  become: true
+  gather_facts: false
+  vars:
+    __verify_marker: /data/rustfs0/.rustfs.sys/healing.bin
+  tasks:
+    - name: Wait until the heal of the replaced drive has ended
+      ansible.builtin.stat:
+        path: /data/rustfs1/.rustfs.sys/healing.bin
+        get_checksum: false
+      register: __verify_real_marker
+      until: not __verify_real_marker['stat']['exists']
+      retries: 60
+      delay: 2
+      delegate_to: rustfs-node4
+
+    - name: Place a healing marker on a drive of rustfs-node3
+      ansible.builtin.copy:
+        content: "molecule"
+        dest: "{{ __verify_marker }}"
+        owner: rustfs
+        group: rustfs
+        mode: "0640"
+      delegate_to: rustfs-node3
+
+    - name: Record the host state
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the run
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_log_level: "warn"
+            rustfs_rpc_secret: "{{ __molecule_rotated_rpc_secret }}"
+            # Short waits: the marker stays.
+            rustfs_ready_retries: 3
+            rustfs_ready_delay: 2
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role restarted rustfs-node1 while a drive of rustfs-node3 was healing"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: >-
+              refusing to restart rustfs-node1: a drive of another cluster host is
+              still healing or could not be checked after 3 x 2 s (rustfs-node3 still
+              has {{ __verify_marker }})
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Remove the healing marker from rustfs-node3
+      ansible.builtin.file:
+        path: "{{ __verify_marker }}"
+        state: absent
+      delegate_to: rustfs-node3
+
+    - name: Record the host state after the refusal
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert rustfs-node1 was not restarted
+      ansible.builtin.assert:
+        that:
+          - __verify_state['main_pid'] == __verify_state_before['main_pid']
+          - __verify_state['main_pid'] | int > 0
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    - name: Clear the failed state the rescued rollout left behind
+      ansible.builtin.meta: clear_host_errors
 
 - name: "Behaviour: the cluster rolls again with every drive online"
   hosts: all

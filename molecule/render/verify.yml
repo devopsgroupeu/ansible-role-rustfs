@@ -52,6 +52,15 @@
         that: "'RUSTFS_IAM_MASTER_KEY' not in __rustfs_secret_env"
         fail_msg: "an empty rustfs_iam_master_key still renders RUSTFS_IAM_MASTER_KEY"
 
+    # No scenario that starts RustFS sets it (their tmpfs drives pass the
+    # distinct-disk check), so its rendering is checked here.
+    - name: Assert the distinct-disk check bypass when it is set
+      vars:
+        rustfs_unsafe_bypass_disk_check: true
+      ansible.builtin.assert:
+        that: __rustfs_env['RUSTFS_UNSAFE_BYPASS_DISK_CHECK'] | default('') == 'true'
+        fail_msg: "rustfs_unsafe_bypass_disk_check: true does not render RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true"
+
     - name: Assert zero padding and pool de-duplication
       vars:
         rustfs_volumes:
