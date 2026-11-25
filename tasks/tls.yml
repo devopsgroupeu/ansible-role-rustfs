@@ -1,0 +1,12 @@
+---
+# ==============================================================================
+# TLS material dispatcher. Every branch is gated on rustfs_tls_enabled: with
+# TLS off there is no material to check (and none must be required).
+# ==============================================================================
+
+- name: Check and permission BYO TLS material
+  ansible.builtin.include_tasks: tls_byo.yml
+  when:
+    - rustfs_tls_enabled | bool
+    - not rustfs_tls_generate_certs | bool
+  tags: tls

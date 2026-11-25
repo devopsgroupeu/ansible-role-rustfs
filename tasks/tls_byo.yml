@@ -1,0 +1,71 @@
+---
+# ==============================================================================
+# BYO TLS: the operator places rustfs_cert.pem, rustfs_key.pem and ca.crt in
+# rustfs_tls_dir; the role never creates or copies them. Preflight P8 has
+# asserted they are in place (its stat results, __rustfs_tls_byo_stat, are
+# reused here). This file enforces owner and mode, then checks that the
+# certificate is valid now and covers rustfs_node_address, so a bad
+# certificate fails here, naming the address and the file, instead of after
+# a readiness timeout. It runs after config.yml: a host that fails here has
+# new files on disk, but its running process is not restarted.
+# ==============================================================================
+
+# The key is readable by the service group only. ca.crt is optional with
+# rustfs_tls_trust_system_ca, so only the files P8 found are touched.
+# state: file follows a symlinked file to its target (without it the file
+# module would treat the path as a link and never converge its mode).
+- name: Set owner and mode of the BYO TLS files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: file
+    owner: root
+    group: "{{ rustfs_group if item == __rustfs_tls_key_file else 'root' }}"
+    mode: "{{ '0640' if item == __rustfs_tls_key_file else '0644' }}"
+  loop: "{{ __rustfs_tls_byo_stat['results'] | selectattr('stat.exists') | map(attribute='item') | list }}"
+  loop_control:
+    label: "{{ item }}"
+  tags: tls
+
+- name: Read the BYO TLS certificate
+  community.crypto.x509_certificate_info:
+    path: "{{ __rustfs_tls_cert_file }}"
+    valid_at:
+      now: "+0s"
+  register: __rustfs_tls_byo_cert
+  tags: tls
+
+# RustFS reloads a replaced certificate without a restart (hot reload is on).
+- name: Validate the BYO TLS certificate is valid now
+  ansible.builtin.assert:
+    that:
+      - __rustfs_tls_byo_cert['valid_at']['now']
+    fail_msg: >-
+      The certificate {{ __rustfs_tls_cert_file }} is expired or not yet valid
+      (not before {{ __rustfs_tls_byo_cert['not_before'] }}, not after
+      {{ __rustfs_tls_byo_cert['not_after'] }}). Place a current certificate
+      in {{ rustfs_tls_dir }}; RustFS picks it up without a restart.
+    quiet: true
+  tags: tls
+
+# Peers and the role's probes connect to rustfs_node_address. A wildcard
+# covers exactly one leftmost label; names compare case-insensitively.
+- name: Validate the BYO TLS certificate covers rustfs_node_address
+  vars:
+    __rustfs_tls_cert_sans: "{{ __rustfs_tls_byo_cert['subject_alt_name'] | default([], true) }}"
+    __rustfs_tls_wanted_sans: >-
+      {{ ['IP:' ~ rustfs_node_address] if __rustfs_node_is_ip | bool
+         else (['DNS:' ~ rustfs_node_address]
+               + (['DNS:*.' ~ rustfs_node_address.split('.', 1)[1]] if '.' in rustfs_node_address else [])) }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_tls_wanted_sans | map('lower') | list | intersect(__rustfs_tls_cert_sans | map('lower') | list) | length > 0
+    fail_msg: >-
+      The certificate {{ __rustfs_tls_cert_file }} does not cover
+      rustfs_node_address '{{ rustfs_node_address }}' of host
+      '{{ inventory_hostname }}': it needs one of {{ __rustfs_tls_wanted_sans }},
+      but its SANs are {{ __rustfs_tls_cert_sans }}. Peers and the role's
+      health probes connect to this name. Issue the certificate with that SAN
+      (in a cluster: this node's host name in rustfs_volumes), or set
+      rustfs_node_address to a name the certificate covers.
+    quiet: true
+  tags: tls

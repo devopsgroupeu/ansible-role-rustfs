@@ -1,0 +1,351 @@
+---
+# ==============================================================================
+# Preflight: read-only host-state guards (P1 to P8). Run after validate.yml
+# and before anything is installed or rendered, tagged always, so no tag
+# selection can bypass them. A host that fails a guard is left untouched.
+# P1 to P4, P6 and P7 inspect the host and are skipped in render mode
+# (rustfs_config_only); P5 (layout) and P8 (BYO TLS files) also run there.
+# Registers read by later files: __rustfs_env_stat and __rustfs_env_current
+# (P5), __rustfs_tls_byo_stat (P8, used by tls_byo.yml).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# P1 to P4: host basics
+# ------------------------------------------------------------------------------
+
+- name: Validate the host runs systemd
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['service_mgr'] | default('') == 'systemd'
+    fail_msg: >-
+      This host reports the service manager
+      '{{ ansible_facts['service_mgr'] | default('unknown') }}'
+      (ansible_facts['service_mgr']). The role runs RustFS as a hardened
+      systemd unit and supports systemd hosts only.
+    quiet: true
+  when: not rustfs_config_only | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# getconf fails on a host without glibc (musl based); the assert then says so.
+- name: Read the glibc version
+  ansible.builtin.command: getconf GNU_LIBC_VERSION
+  register: __rustfs_glibc
+  failed_when: false
+  when:
+    - not rustfs_config_only | bool
+    - rustfs_libc == 'gnu'
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Validate glibc for the gnu build
+  vars:
+    __rustfs_glibc_version: "{{ __rustfs_glibc['stdout'] | default('') | regex_findall('[0-9]+[.][0-9]+') | first | default('0') }}"
+  ansible.builtin.assert:
+    that:
+      - __rustfs_glibc['rc'] | default(1) == 0
+      - __rustfs_glibc_version is version('2.31', '>=')
+    fail_msg: >-
+      rustfs_libc "gnu" needs glibc 2.31 or newer, but this host reports
+      '{{ __rustfs_glibc['stdout'] | default('') | trim or 'no glibc' }}'
+      (getconf GNU_LIBC_VERSION). Use rustfs_libc: "musl" (the static
+      build, the default).
+    quiet: true
+  when:
+    - not rustfs_config_only | bool
+    - rustfs_libc == 'gnu'
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Check that every data dir is a mount point
+  ansible.builtin.command:
+    argv:
+      - mountpoint
+      - -q
+      - "{{ item }}"
+  loop: "{{ rustfs_data_dirs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: __rustfs_mountpoints
+  failed_when: false
+  when:
+    - not rustfs_config_only | bool
+    - rustfs_require_mounted_drives | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Validate the data dirs are mounted drives
+  vars:
+    __rustfs_unmounted: "{{ __rustfs_mountpoints['results'] | default([]) | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+  ansible.builtin.assert:
+    that:
+      - __rustfs_unmounted | length == 0
+    fail_msg: >-
+      rustfs_require_mounted_drives is true, but these data dirs are not mount
+      points: {{ __rustfs_unmounted }}. The role refuses to write object data
+      to the root disk. Mount a dedicated drive at every path of
+      rustfs_data_dirs first (fstab or a systemd mount unit), or set
+      rustfs_require_mounted_drives: false on dev/test hosts only.
+    quiet: true
+  when:
+    - not rustfs_config_only | bool
+    - rustfs_require_mounted_drives | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# systemd follows symlinks for ReadWritePaths, so the stat follows them too.
+- name: Stat the extra read-write paths
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+  loop: "{{ rustfs_systemd_read_write_paths }}"
+  loop_control:
+    label: "{{ item }}"
+  register: __rustfs_rw_path_stat
+  when: not rustfs_config_only | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Validate the extra read-write paths exist
+  vars:
+    __rustfs_missing_rw_paths: >-
+      {{ __rustfs_rw_path_stat['results'] | default([]) | rejectattr('stat.exists') | map(attribute='item') | list }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_missing_rw_paths | length == 0
+    fail_msg: >-
+      rustfs_systemd_read_write_paths entries {{ __rustfs_missing_rw_paths }}
+      do not exist on this host. systemd refuses to start a unit whose
+      ReadWritePaths entry is missing (226/NAMESPACE). Create them first
+      (owned by rustfs_user when RustFS writes there), or remove them from
+      the list.
+    quiet: true
+  when: not rustfs_config_only | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P5: layout guard (render mode too)
+# ------------------------------------------------------------------------------
+
+- name: Stat the deployed env file
+  ansible.builtin.stat:
+    path: "{{ rustfs_env_file }}"
+    get_checksum: false
+  register: __rustfs_env_stat
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Read the deployed env file
+  ansible.builtin.slurp:
+    src: "{{ rustfs_env_file }}"
+  register: __rustfs_env_current
+  when: __rustfs_env_stat['stat']['exists']
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# systemd takes the last assignment of a key; the value may be quoted or not
+# (an env file the role did not write).
+- name: Validate the volume layout is unchanged
+  vars:
+    __rustfs_deployed_env: "{{ __rustfs_env_current['content'] | b64decode }}"
+    __rustfs_deployed_volumes: >-
+      {{ __rustfs_deployed_env | regex_findall('(?m)^RUSTFS_VOLUMES=(.*)$') | last | default('') | trim('"') }}
+    __rustfs_deployed_set_size: >-
+      {{ __rustfs_deployed_env | regex_findall('(?m)^RUSTFS_ERASURE_SET_DRIVE_COUNT=(.*)$') | last | default('') | trim('"') }}
+    __rustfs_desired_set_size: "{{ rustfs_extra_env['RUSTFS_ERASURE_SET_DRIVE_COUNT'] | default('') }}"
+    # Only the values that differ.
+    __rustfs_layout_diff: >-
+      {{ [('RUSTFS_VOLUMES deployed "' ~ __rustfs_deployed_volumes ~ '", desired "' ~ __rustfs_volumes_string ~ '"')
+          if __rustfs_deployed_volumes != __rustfs_volumes_string else '',
+          ('RUSTFS_ERASURE_SET_DRIVE_COUNT deployed "' ~ (__rustfs_deployed_set_size or 'unset')
+           ~ '", desired "' ~ (__rustfs_desired_set_size or 'unset') ~ '"')
+          if __rustfs_deployed_set_size != __rustfs_desired_set_size else '']
+         | select | join('; ') }}
+  ansible.builtin.assert:
+    that:
+      - >-
+        rustfs_allow_volumes_change | bool
+        or (__rustfs_deployed_volumes == __rustfs_volumes_string
+            and __rustfs_deployed_set_size == __rustfs_desired_set_size)
+    fail_msg: >-
+      The storage layout differs from the one deployed in {{ rustfs_env_file }}:
+      {{ __rustfs_layout_diff }}. Nothing was changed. The pool layout and the
+      erasure set size of an initialised pool are immutable: RustFS refuses to
+      start on a different layout, and reordered or resized pools can lose
+      data. The only legitimate volumes change is appending a pool or removing
+      a decommissioned pool. For that, set rustfs_allow_volumes_change: true
+      for this run; the changed nodes are then restarted together.
+    quiet: true
+  when: __rustfs_env_stat['stat']['exists']
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P6: binary guard
+# ------------------------------------------------------------------------------
+
+- name: Stat the rustfs binary path
+  ansible.builtin.stat:
+    path: "{{ __rustfs_bin }}"
+    follow: false
+    get_checksum: false
+  register: __rustfs_bin_stat
+  when: not rustfs_config_only | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# The role installs __rustfs_bin as a symlink to
+# <rustfs_bin_dir>/rustfs-<version>-<libc>. "" when the path is missing or is
+# anything else.
+- name: Read the installed version from the binary symlink
+  ansible.builtin.set_fact:
+    __rustfs_installed_version: >-
+      {{ (__rustfs_bin_stat['stat']['lnk_target'] | default(''))
+         | regex_findall('^' ~ (rustfs_bin_dir | regex_escape)
+                         ~ '/rustfs-([0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.]+)?)-(?:musl|gnu)$')
+         | first | default('') }}
+  when: not rustfs_config_only | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Validate no unmanaged binary sits at the binary path
+  vars:
+    __rustfs_bin_kind: >-
+      {{ ('a symlink to ' ~ __rustfs_bin_stat['stat']['lnk_target'])
+         if __rustfs_bin_stat['stat']['islnk'] | default(false)
+         else ('a directory' if __rustfs_bin_stat['stat']['isdir'] | default(false) else 'a regular file') }}
+  ansible.builtin.assert:
+    that:
+      - not __rustfs_bin_stat['stat']['exists'] or __rustfs_installed_version != ''
+    fail_msg: >-
+      An unmanaged RustFS binary exists at {{ __rustfs_bin }}
+      ({{ __rustfs_bin_kind }}). The role manages {{ __rustfs_bin }} as a symlink to
+      {{ rustfs_bin_dir }}/rustfs-<version>-<libc> and never replaces a binary
+      it did not install. Move it away before running the role (stop the
+      service that uses it first), or set rustfs_bin_dir to another
+      directory.
+    quiet: true
+  when: not rustfs_config_only | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+- name: Validate rustfs_version is not a downgrade
+  ansible.builtin.assert:
+    that:
+      - rustfs_version is version(__rustfs_installed_version, '>=', version_type='semver')
+    fail_msg: >-
+      rustfs_version {{ rustfs_version }} is lower than the installed version
+      {{ __rustfs_installed_version }} ({{ __rustfs_bin }} ->
+      {{ __rustfs_bin_stat['stat']['lnk_target'] | default('') }}). Upstream
+      documents only an immediate rollback to the previous release. Read the
+      release notes, then set rustfs_allow_downgrade: true for the rollback.
+    quiet: true
+  when:
+    - not rustfs_config_only | bool
+    - not rustfs_allow_downgrade | bool
+    - __rustfs_installed_version | default('') != ''
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P7: first-bootstrap completeness (distributed only)
+# ------------------------------------------------------------------------------
+
+# Evaluated on every host (no run_once), so every host reports it. A host
+# that failed an earlier task has left ansible_play_hosts and counts as
+# missing.
+- name: Validate the first bootstrap includes every cluster host
+  vars:
+    __rustfs_deployed_hosts: >-
+      {{ ansible_play_hosts | map('extract', hostvars) | selectattr('__rustfs_env_stat', 'defined')
+         | selectattr('__rustfs_env_stat.stat.exists') | map(attribute='inventory_hostname') | list }}
+    __rustfs_absent_hosts: "{{ rustfs_cluster_hosts | difference(ansible_play_hosts) }}"
+  ansible.builtin.assert:
+    that:
+      - __rustfs_deployed_hosts | length > 0 or __rustfs_absent_hosts | length == 0
+    fail_msg: >-
+      First bootstrap: no host of this play has {{ rustfs_env_file }} yet, but
+      the cluster hosts {{ __rustfs_absent_hosts }} are not in the play. A new
+      cluster starts only when every node of rustfs_cluster_hosts runs in the
+      same play (no --limit, no failed or unreachable hosts). Adding or
+      replacing a node in a running cluster is also done by running the play
+      against the whole cluster.
+    quiet: true
+  when:
+    - not rustfs_config_only | bool
+    - __rustfs_distributed | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# ------------------------------------------------------------------------------
+# P8: BYO TLS material (render mode too). SAN and expiry: tls_byo.yml.
+# ------------------------------------------------------------------------------
+
+# Follows symlinks (certificate tooling often links into rustfs_tls_dir); a
+# dangling link counts as missing. tls_byo.yml reuses these results.
+- name: Stat the BYO TLS files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: false
+  loop:
+    - "{{ __rustfs_tls_cert_file }}"
+    - "{{ __rustfs_tls_key_file }}"
+    - "{{ __rustfs_tls_ca_file }}"
+  loop_control:
+    label: "{{ item }}"
+  register: __rustfs_tls_byo_stat
+  when:
+    - rustfs_tls_enabled | bool
+    - not rustfs_tls_generate_certs | bool
+  check_mode: false
+  changed_when: false
+  tags: always
+
+# ca.crt is optional only with rustfs_tls_trust_system_ca.
+- name: Validate the BYO TLS files are in place
+  vars:
+    __rustfs_tls_missing: >-
+      {%- set ns = namespace(out=[]) -%}
+      {%- for r in __rustfs_tls_byo_stat['results'] -%}
+      {%-   if not (r['stat']['isreg'] | default(false))
+               and not (r['item'] == __rustfs_tls_ca_file and rustfs_tls_trust_system_ca | bool) -%}
+      {%-     set ns.out = ns.out + [r['item']] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.out }}
+  ansible.builtin.assert:
+    that:
+      - __rustfs_tls_missing | length == 0
+    fail_msg: >-
+      TLS is on with operator-supplied material (rustfs_tls_enabled true,
+      rustfs_tls_generate_certs false), but these files are missing or not
+      regular files: {{ __rustfs_tls_missing | join(', ') }}. The role never creates or copies BYO TLS
+      material: place rustfs_cert.pem (with a SAN for rustfs_node_address),
+      rustfs_key.pem and, unless rustfs_tls_trust_system_ca is true, the CA
+      certificate ca.crt in {{ rustfs_tls_dir }} before running the role, or
+      set rustfs_tls_generate_certs: true on dev/test hosts.
+    quiet: true
+  when:
+    - rustfs_tls_enabled | bool
+    - not rustfs_tls_generate_certs | bool
+  check_mode: false
+  changed_when: false
+  tags: always

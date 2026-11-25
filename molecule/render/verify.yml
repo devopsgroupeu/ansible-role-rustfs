@@ -563,9 +563,108 @@
             __verify_secret: ""
 
 # ------------------------------------------------------------------------------
+# Negative plays of the host guards that also run in render mode
+# (tasks/preflight.yml): the layout guard P5, against the env file converge
+# rendered, and the BYO TLS material check P8. Both refuse before config.yml.
+# ------------------------------------------------------------------------------
+
+# Twice the drives per node without the override: a pool layout is immutable.
+- name: "Negative: changed layout"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_volumes: ["https://rustfs-render{1...4}:9000/data/rustfs{0...7}"]
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a changed layout without rustfs_allow_volumes_change"
+      rescue:
+        - name: Check the refusal names the override
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_allow_volumes_change"
+            __verify_secret: ""
+
+        - name: Check the refusal names the deployed volumes
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "https://rustfs-render{1...4}:9000/data/rustfs{0...3}"
+            __verify_secret: ""
+
+        - name: Check the refusal names the desired volumes
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "https://rustfs-render{1...4}:9000/data/rustfs{0...7}"
+            __verify_secret: ""
+
+# The erasure set size of an initialised pool is immutable too.
+- name: "Negative: changed erasure set size"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_extra_env:
+              RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE: "bounded"
+              RUSTFS_ERASURE_SET_DRIVE_COUNT: "8"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a changed erasure set size without rustfs_allow_volumes_change"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "RUSTFS_ERASURE_SET_DRIVE_COUNT"
+            __verify_secret: ""
+
+# BYO material is the operator's job: a missing key is refused by path.
+- name: "Negative: missing BYO TLS key"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Move the BYO TLS key away
+          ansible.builtin.command: mv /etc/rustfs/tls/rustfs_key.pem /root/key.bak
+          changed_when: true
+
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a missing BYO TLS key"
+      rescue:
+        - name: Check the refusal
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "/etc/rustfs/tls/rustfs_key.pem"
+            __verify_secret: ""
+      always:
+        - name: Move the BYO TLS key back
+          ansible.builtin.command: mv /root/key.bak /etc/rustfs/tls/rustfs_key.pem
+          changed_when: true
+
+# ------------------------------------------------------------------------------
 # Rendered files of the converge run (positive). This play must stay before
-# any play that renders files: the negative plays above fail in validate.yml,
-# before config.yml, so the files on disk are still the ones converge wrote.
+# any play that renders files: the negative plays above fail in validate.yml
+# or preflight.yml, before config.yml, so the files on disk are still the
+# ones converge wrote.
 # ------------------------------------------------------------------------------
 
 - name: Verify rendered files
@@ -687,6 +786,10 @@
         - {path: /etc/default/rustfs, dir: false, owner: root, group: rustfs, mode: "0640"}
         - {path: /etc/rustfs/secrets.env, dir: false, owner: root, group: root, mode: "0600"}
         - {path: /etc/systemd/system/rustfs.service, dir: false, owner: root, group: root, mode: "0644"}
+        # BYO TLS material: prepare wrote the key root:root 0600 on purpose.
+        - {path: /etc/rustfs/tls/rustfs_key.pem, dir: false, owner: root, group: rustfs, mode: "0640"}
+        - {path: /etc/rustfs/tls/rustfs_cert.pem, dir: false, owner: root, group: root, mode: "0644"}
+        - {path: /etc/rustfs/tls/ca.crt, dir: false, owner: root, group: root, mode: "0644"}
       loop_control:
         label: "{{ item['path'] }}"
       register: __verify_paths
@@ -708,6 +811,122 @@
       loop: "{{ __verify_paths['results'] }}"
       loop_control:
         label: "{{ item['item']['path'] }}"
+
+# ------------------------------------------------------------------------------
+# Negative plays of the BYO certificate checks (tasks/tls_byo.yml). They fail
+# after config.yml has rendered, so they run after the positive play; the SAN
+# negative is the last one, and the play after it renders the scenario layout
+# again.
+# ------------------------------------------------------------------------------
+
+# Same key and SANs, but the certificate expired yesterday.
+- name: "Negative: expired BYO certificate"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Move the BYO certificate away
+          ansible.builtin.command: mv /etc/rustfs/tls/rustfs_cert.pem /root/cert.bak
+          changed_when: true
+
+        - name: Create a CSR for the expired node certificate
+          community.crypto.openssl_csr_pipe:
+            privatekey_path: /etc/rustfs/tls/rustfs_key.pem
+            common_name: rustfs-render1
+            use_common_name_for_san: false
+            subject_alt_name:
+              - "DNS:rustfs-render1"
+              - "DNS:localhost"
+              - "IP:127.0.0.1"
+            extended_key_usage:
+              - serverAuth
+          register: __verify_expired_csr
+          changed_when: false
+
+        - name: Sign a node certificate that expired yesterday
+          community.crypto.x509_certificate:
+            path: /etc/rustfs/tls/rustfs_cert.pem
+            csr_content: "{{ __verify_expired_csr['csr'] }}"
+            provider: ownca
+            ownca_path: /etc/rustfs/tls/ca.crt
+            ownca_privatekey_path: /root/rustfs-molecule-ca.key
+            ownca_not_before: "-10d"
+            ownca_not_after: "-1d"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted an expired BYO certificate"
+      rescue:
+        - name: Check the refusal names the certificate
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "/etc/rustfs/tls/rustfs_cert.pem"
+            __verify_secret: ""
+
+        - name: Check the refusal says it is expired
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "expired"
+            __verify_secret: ""
+      always:
+        - name: Move the BYO certificate back
+          ansible.builtin.command: mv /root/cert.bak /etc/rustfs/tls/rustfs_cert.pem
+          changed_when: true
+
+# The certificate covers rustfs-render1, not node1.example.com.
+- name: "Negative: BYO certificate without the node address"
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_volumes: ["https://node{1...4}.example.com:9000/data/rustfs{0...3}"]
+            rustfs_node_address: "node1.example.com"
+            rustfs_allow_volumes_change: true
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a BYO certificate without a SAN for the node address"
+      rescue:
+        - name: Check the refusal names the node address
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "node1.example.com"
+            __verify_secret: ""
+
+        - name: Check the refusal names the certificate
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_cert.pem"
+            __verify_secret: ""
+
+# The SAN negative rendered node{1...4}.example.com volumes before it failed.
+# This converge renders the scenario layout again, so the variants below that
+# keep the converge volumes meet them on disk.
+- name: Converge the scenario layout again
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_allow_volumes_change: true
 
 # ------------------------------------------------------------------------------
 # Variant plays: "Converge <variant>" re-renders the files with the variant
@@ -846,6 +1065,42 @@
           - __verify_unit.index('AssertPathIsMountPoint=') < __verify_unit.index('[Service]')
           - __verify_unit.index('RequiresMountsFor=') < __verify_unit.index('[Service]')
         fail_msg: "RequiresMountsFor or one AssertPathIsMountPoint per data dir is missing from [Unit]"
+
+# With the OS trust store, ca.crt is optional: the role must not require it.
+- name: Converge trust system CA
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run the role without ca.crt
+      block:
+        - name: Move ca.crt away
+          ansible.builtin.command: mv /etc/rustfs/tls/ca.crt /root/ca.bak
+          changed_when: true
+
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_tls_trust_system_ca: true
+      always:
+        - name: Move ca.crt back
+          ansible.builtin.command: mv /root/ca.bak /etc/rustfs/tls/ca.crt
+          changed_when: true
+
+- name: Verify trust system CA
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the rendered files
+      ansible.builtin.include_tasks: ../shared/tasks/read_rendered.yml
+
+    - name: Assert the env file trusts the system CA store
+      ansible.builtin.assert:
+        that:
+          - "'RUSTFS_TRUST_SYSTEM_CA=\"true\"' in __verify_env"
+        fail_msg: "RUSTFS_TRUST_SYSTEM_CA is not \"true\" with rustfs_tls_trust_system_ca"
 
 - name: Converge TLS disabled
   hosts: all

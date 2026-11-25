@@ -1,16 +1,25 @@
 ---
 # ==============================================================================
-# Orchestrator: include_tasks only, one tag per stage. Guards (validate) run
-# first and are tagged always, so no tag selection can bypass them.
+# Orchestrator: include_tasks only, one tag per stage. The guards (validate
+# and preflight) run first and are tagged always, so no tag selection can
+# bypass them; they only read, so a host that fails one is left untouched.
 # ==============================================================================
 
 - name: Validate configuration variables
   ansible.builtin.include_tasks: validate.yml
   tags: always
 
+- name: Check the host before changing it
+  ansible.builtin.include_tasks: preflight.yml
+  tags: always
+
 - name: Render configuration files and the systemd unit
   ansible.builtin.include_tasks: config.yml
   tags: config
+
+- name: Check TLS material
+  ansible.builtin.include_tasks: tls.yml
+  tags: tls
 
 # Reload systemd for a changed unit before the service is managed.
 - name: Flush handlers before service management
