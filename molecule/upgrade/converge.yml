@@ -1,0 +1,21 @@
+---
+# Converge for the upgrade scenario: the previous release as the gnu build.
+# All other scenario variables live in provisioner.inventory.group_vars.rustfs
+# of molecule.yml. rustfs_checksum stays empty and the previous version has
+# no pinned digest, so get_url checks the zip against the release SHA256SUMS
+# (checksum path 3); rustfs_libc "gnu" runs the glibc preflight (P2).
+# The upgrade, the refused downgrade and the rollback live in side_effect.yml,
+# so idempotence re-runs only this plain converge.
+
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Include rustfs role
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_version: "{{ __molecule_previous_version }}"
+        rustfs_libc: "gnu"
+        rustfs_checksum: ""

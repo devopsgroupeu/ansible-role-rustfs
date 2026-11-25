@@ -1,0 +1,251 @@
+---
+# Side effect of the upgrade scenario (spec 10.1 upgrade, steps 1 to 4).
+# converge installed the previous release (gnu build, SHA256SUMS digest).
+#   1. write an object and record the main PID;
+#   2. upgrade to the role's default version and build with
+#      rustfs_rolling_restart false: the pinned digest (checksum path 2) and
+#      the together restart of one node;
+#   3. ask for the previous version without rustfs_allow_downgrade: refused
+#      by preflight P6, nothing changes (main PID, symlink, env file);
+#   4. roll back to the previous gnu build with rustfs_allow_downgrade: the
+#      binary is already there, the symlink flips and the node restarts in
+#      the rolling path.
+# The main PID assertions live here because facts do not survive into the
+# separate verify playbook.
+
+- name: "Side effect: upgrade, refused downgrade and rollback"
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    __verify_url: "http://localhost:9000"
+    __verify_role_dir: "{{ playbook_dir }}/../.."
+    # argv of every signed S3 request (curl SigV4). The explicit
+    # x-amz-content-sha256 header is needed by curl before mid-2023 (EL9).
+    __verify_s3_curl:
+      - curl
+      - --silent
+      - --show-error
+      - --aws-sigv4
+      - "aws:amz:us-east-1:s3"
+      - --user
+      - "{{ rustfs_access_key }}:{{ rustfs_secret_key }}"
+      - -H
+      - "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+  tasks:
+    # Read from the role's files, so a version bump needs no change here.
+    - name: Read the default version and the pinned digests of the role
+      ansible.builtin.set_fact:
+        __verify_default_version: "{{ (lookup('ansible.builtin.file', __verify_role_dir ~ '/defaults/main.yml') | from_yaml)['rustfs_version'] }}"
+        __verify_pinned: "{{ (lookup('ansible.builtin.file', __verify_role_dir ~ '/vars/main.yml') | from_yaml)['__rustfs_checksums'] }}"
+
+    # Which checksum path each install takes (spec 4.1): converge has no
+    # pinned digest (path 3, SHA256SUMS), step 2 has one (path 2).
+    - name: Assert the scenario versions and their checksum paths
+      ansible.builtin.assert:
+        that:
+          - __molecule_previous_version is version(__verify_default_version, '<', version_type='semver')
+          - __molecule_previous_version not in __verify_pinned
+          - (__verify_pinned[__verify_default_version] | default({}))[ansible_facts['architecture'] ~ '-musl'] is defined
+        fail_msg: >-
+          __molecule_previous_version {{ __molecule_previous_version }} must be
+          lower than the default rustfs_version {{ __verify_default_version }} and
+          have no pinned digest; the default version must have one for
+          {{ ansible_facts['architecture'] }}-musl (pinned: {{ __verify_pinned | list }})
+
+    # --------------------------------------------------------------------------
+    # Step 1: the converged previous release serves; write the test object
+    # --------------------------------------------------------------------------
+
+    - name: Read the running process after converge
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Probe /health/ready after converge
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+      register: __verify_ready_1
+
+    - name: Assert converge runs the previous gnu build
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_exe == '/usr/local/bin/rustfs-' ~ __molecule_previous_version ~ '-gnu'
+          - __verify_ready_1['json']['ready'] is true
+          - __verify_ready_1['json']['version'] == __molecule_previous_version
+        fail_msg: >-
+          converge left exe {{ __verify_proc_exe }}, ready
+          {{ __verify_ready_1['json'] | default(__verify_ready_1['status']) }}
+
+    - name: Keep the main PID of step 1
+      ansible.builtin.set_fact:
+        __verify_pid_1: "{{ __verify_proc_pid }}"
+
+    - name: Write the test object payload
+      ansible.builtin.copy:
+        content: "molecule-upgrade-payload"
+        dest: /root/molecule-upgrade.txt
+        owner: root
+        group: root
+        mode: "0600"
+
+    # 409 when an earlier side_effect run created it already.
+    - name: Create the test bucket over S3
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--output', '/dev/null', '--write-out', '%{http_code}',
+                                 '-X', 'PUT', __verify_url ~ '/molecule-bucket'] }}
+      register: __verify_bucket
+      changed_when: false
+      no_log: true
+
+    - name: Assert the test bucket exists
+      ansible.builtin.assert:
+        that:
+          - __verify_bucket['rc'] == 0
+          - __verify_bucket['stdout'] in ['200', '409']
+        fail_msg: "bucket creation returned rc {{ __verify_bucket['rc'] }}, HTTP {{ __verify_bucket['stdout'] }}"
+
+    - name: Upload the test object over S3
+      ansible.builtin.command:
+        argv: >-
+          {{ __verify_s3_curl + ['--fail', '--upload-file', '/root/molecule-upgrade.txt',
+                                 __verify_url ~ '/molecule-bucket/object.txt'] }}
+      changed_when: false
+      no_log: true
+
+    # --------------------------------------------------------------------------
+    # Step 2: upgrade, together restart (pinned digest)
+    # --------------------------------------------------------------------------
+
+    - name: Upgrade to the default version and build
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_rolling_restart: false
+
+    - name: Read the running process after the upgrade
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Probe /health/ready after the upgrade
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+      register: __verify_ready_2
+
+    - name: Download the test object after the upgrade
+      ansible.builtin.command:
+        argv: "{{ __verify_s3_curl + ['--fail', __verify_url ~ '/molecule-bucket/object.txt'] }}"
+      register: __verify_get_2
+      changed_when: false
+      no_log: true
+
+    - name: Assert the upgrade restarted together onto the new binary
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_pid | int != __verify_pid_1 | int
+          - __verify_proc_exe == '/usr/local/bin/rustfs-' ~ __verify_default_version ~ '-musl'
+          - __verify_ready_2['json']['ready'] is true
+          - __verify_ready_2['json']['version'] == __verify_default_version
+          - __verify_get_2['stdout'] == 'molecule-upgrade-payload'
+          - __rustfs_state == 'running'
+          - __rustfs_restart_needed
+          - __rustfs_restart_together
+          - __rustfs_restart_reasons == ['binary']
+        fail_msg: >-
+          main PID {{ __verify_pid_1 }} -> {{ __verify_proc_pid }}, exe {{ __verify_proc_exe }},
+          ready {{ __verify_ready_2['json'] | default(__verify_ready_2['status']) }},
+          object {{ __verify_get_2['stdout'] | default('') | length }} bytes,
+          state {{ __rustfs_state | default('unset') }},
+          together {{ __rustfs_restart_together | default('unset') }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}
+
+    - name: Keep the main PID of step 2
+      ansible.builtin.set_fact:
+        __verify_pid_2: "{{ __verify_proc_pid }}"
+
+    # --------------------------------------------------------------------------
+    # Step 3: downgrade without rustfs_allow_downgrade is refused
+    # --------------------------------------------------------------------------
+
+    - name: Record the host state before the refused downgrade
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Keep the state before the refused downgrade
+      ansible.builtin.set_fact:
+        __verify_state_before: "{{ __verify_state }}"
+
+    # The previous gnu binary is still installed, so without the guard this
+    # run would only flip the symlink and restart.
+    - name: Run the role expecting a refusal
+      block:
+        - name: Include rustfs role
+          ansible.builtin.include_role:
+            name: ansible-role-rustfs
+          vars:
+            rustfs_version: "{{ __molecule_previous_version }}"
+            rustfs_libc: "gnu"
+
+        - name: Fail because the role did not refuse
+          ansible.builtin.fail:
+            msg: "role accepted a downgrade without rustfs_allow_downgrade"
+      rescue:
+        - name: Check the refusal names the override
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: "rustfs_allow_downgrade"
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+        - name: Check the refusal names both versions
+          ansible.builtin.include_tasks: ../shared/tasks/expect_failure.yml
+          vars:
+            __verify_expect: >-
+              rustfs_version {{ __molecule_previous_version }} is lower than the
+              installed version {{ __verify_default_version }}
+            __verify_secret: "{{ rustfs_secret_key }}"
+
+    - name: Record the host state after the refused downgrade
+      ansible.builtin.include_tasks: ../shared/tasks/record_state.yml
+
+    - name: Assert the refused downgrade changed nothing
+      ansible.builtin.assert:
+        that:
+          - __verify_state == __verify_state_before
+          - __verify_state['main_pid'] | int == __verify_pid_2 | int
+          - __verify_state['link_target'] == '/usr/local/bin/rustfs-' ~ __verify_default_version ~ '-musl'
+        fail_msg: "host state before {{ __verify_state_before }}, after {{ __verify_state }}"
+
+    # --------------------------------------------------------------------------
+    # Step 4: rollback with the override, rolling path on one node
+    # --------------------------------------------------------------------------
+
+    - name: Roll back to the previous gnu build
+      ansible.builtin.include_role:
+        name: ansible-role-rustfs
+      vars:
+        rustfs_version: "{{ __molecule_previous_version }}"
+        rustfs_libc: "gnu"
+        rustfs_allow_downgrade: true
+
+    - name: Read the running process after the rollback
+      ansible.builtin.include_tasks: ../shared/tasks/read_process.yml
+
+    - name: Probe /health/ready after the rollback
+      ansible.builtin.uri:
+        url: "{{ __verify_url }}/health/ready"
+      register: __verify_ready_4
+
+    - name: Assert the rollback restarted in the rolling path onto the previous binary
+      ansible.builtin.assert:
+        that:
+          - __verify_proc_pid | int != __verify_pid_2 | int
+          - __verify_proc_exe == '/usr/local/bin/rustfs-' ~ __molecule_previous_version ~ '-gnu'
+          - __verify_ready_4['json']['ready'] is true
+          - __verify_ready_4['json']['version'] == __molecule_previous_version
+          - __rustfs_state == 'running'
+          - __rustfs_restart_needed
+          - not __rustfs_restart_together
+          - __rustfs_restart_reasons == ['binary']
+        fail_msg: >-
+          main PID {{ __verify_pid_2 }} -> {{ __verify_proc_pid }}, exe {{ __verify_proc_exe }},
+          ready {{ __verify_ready_4['json'] | default(__verify_ready_4['status']) }},
+          state {{ __rustfs_state | default('unset') }},
+          together {{ __rustfs_restart_together | default('unset') }},
+          reasons {{ __rustfs_restart_reasons | default('unset') }}

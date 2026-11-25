@@ -1,0 +1,87 @@
+---
+# Upgrade, refused downgrade and rollback on one container (SNSD, plain
+# HTTP). converge installs the previous release as the gnu build with no
+# rustfs_checksum, so the digest comes from the release SHA256SUMS
+# (checksum path 3) and the glibc preflight runs against the real glibc.
+# side_effect.yml then upgrades to the default version and build (pinned
+# digest, path 2) with a together restart, checks that a downgrade without
+# rustfs_allow_downgrade is refused and changes nothing, and rolls back to
+# the previous gnu build with the override (rolling path on one node).
+# verify.yml checks the final state. Bump __molecule_previous_version
+# together with rustfs_version (CONTRIBUTING, "Bumping the RustFS version").
+
+dependency:
+  name: galaxy
+
+driver:
+  name: docker
+
+platforms:
+  - name: rustfs-upgrade
+    image: "geerlingguy/docker-${MOLECULE_DISTRO:-debian12}-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    command: ""
+    groups:
+      - rustfs
+
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.."
+    # Run without top-level fact variables (the ansible-core 2.24 default) to
+    # prove the role only reads ansible_facts.
+    ANSIBLE_INJECT_FACT_VARS: "False"
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+      callbacks_enabled: profile_tasks, timer
+      stdout_callback: default
+    ssh_connection:
+      pipelining: false
+  inventory:
+    hosts:
+      all:
+        vars:
+          ansible_user: root
+    group_vars:
+      rustfs:
+        # Plain HTTP: the scenario is about the binary, not TLS (TLS is
+        # covered by default and distributed).
+        rustfs_tls_enabled: false
+        # SNSD: one node, one drive (no distinct-disk check, no RPC secret).
+        rustfs_volumes:
+          - "/data/rustfs0"
+        # Container: the data dir is a plain directory, not a mount point.
+        rustfs_require_mounted_drives: false
+        # Container: the data dir sits on the overlayfs root filesystem.
+        rustfs_unsupported_fs_policy: "warn"
+        # Test root access key (the default "" is refused).
+        rustfs_access_key: "MOLECULEADMIN"
+        # Test root secret key.
+        rustfs_secret_key: "molecule-secret-key-0123456789"
+        # Scenario variable, not a role variable: the release before the
+        # role's default rustfs_version. It has no pinned digest in
+        # vars/main.yml, so its install uses the release SHA256SUMS.
+        __molecule_previous_version: "1.0.5"
+
+verifier:
+  name: ansible
+
+scenario:
+  test_sequence:
+    - dependency
+    - cleanup
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - idempotence
+    - side_effect
+    - verify
+    - cleanup
+    - destroy
