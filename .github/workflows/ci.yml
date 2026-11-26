@@ -34,14 +34,14 @@ jobs:
         run: ansible-lint --profile production .
       - name: ansible-lint (Molecule and example playbooks)
         # The role lint above does not process molecule/ and examples/. The
-        # Molecule playbooks name the role by its directory, which sits in the
-        # parent of the checkout.
+        # Molecule playbooks name the role by its directory (mock_roles in
+        # .ansible-lint); the examples use devopsgroupeu.rustfs, which
+        # ansible-lint resolves to this checkout as long as
+        # ANSIBLE_ROLES_PATH is not set.
         run: >-
           ansible-lint --profile production
           molecule/*/*.yml molecule/*/tasks/*.yml
           examples/*.yml examples/inventory/*.yml
-        env:
-          ANSIBLE_ROLES_PATH: ${{ github.workspace }}/..
       - name: Drift gates
         # CONTRIBUTING "Variable count check" and "ASCII check": defaults,
         # argument specs and docs/CONFIGURATION.md list the same variables,
