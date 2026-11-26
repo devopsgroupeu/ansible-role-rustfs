@@ -428,9 +428,10 @@ The CI pipeline (`ci.yml`) runs on pushes and pull requests to `main` and
 `develop`. The `lint` job runs `yamllint`,
 `ansible-lint --profile production` on the role and on the Molecule and
 example playbooks, and the variable count and ASCII checks of
-[CONTRIBUTING.md](.github/CONTRIBUTING.md). The `molecule` job runs `render` and
-`default` on `debian12`, `debian13` and `ubuntu2404`, `default` also on
-`rockylinux9`, and `upgrade` on `debian12`. On `default`/`debian12` it keeps
+[CONTRIBUTING.md](.github/CONTRIBUTING.md). The `molecule` job runs `default`
+on `debian12`, `debian13`, `ubuntu2404` and `rockylinux9`, and `render` and
+`upgrade` on `debian12` (what they test does not depend on the
+distribution). On `default`/`debian12` it keeps
 the container, fails when a test secret appears in the Molecule log, and runs
 a check-mode converge (`--check --diff`) of the converged host that must
 report `changed=0` and `failed=0` and print no secret. The

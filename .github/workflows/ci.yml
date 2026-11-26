@@ -67,15 +67,13 @@ jobs:
       # default also runs on rockylinux9, which covers the EL 9 path (dnf
       # dependencies, the EL CA bundle and update-ca-trust in the probe trust
       # plays). SELinux is off in the container, so it is not covered.
+      # render only renders files and refuses bad input, which does not
+      # depend on the distribution, so it runs once.
       matrix:
         include:
           # render scenario - offline, no RustFS binary, guard refusals
           - scenario: render
             distro: debian12
-          - scenario: render
-            distro: debian13
-          - scenario: render
-            distro: ubuntu2404
           # default scenario - install, start, S3 round trip, behaviour plays
           - scenario: default
             distro: debian12
