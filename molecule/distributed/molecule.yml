@@ -98,8 +98,10 @@ provisioner:
       interpreter_python: auto_silent
       callbacks_enabled: profile_tasks, timer
       stdout_callback: default
-    ssh_connection:
-      pipelining: false
+    connection:
+      # One docker exec per module instead of several (temp dir, transfer,
+      # run, clean up): about a third faster, same results.
+      pipelining: true
   inventory:
     hosts:
       all:
